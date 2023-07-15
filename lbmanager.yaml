@@ -1,0 +1,22 @@
+grpc:
+  listen: 0.0.0.0
+  port: 9999
+dbDir: /tmp/db
+loadbalancer:
+  namespace: LB
+  externalInterface: eno1
+  internalInterface: eth1
+  ipam:
+    # Simple IPAM
+    
+    # cidr is the network in which this IPAM operates
+    cidr: 192.168.77.0/24
+    # dynamicRange is the range from which random LB addresses
+    # will be taken. 
+    # It's valid to explicitly ask for an IP address that is 
+    # outside this range, as long as it's inside the cidr.
+    # The entire dynamicRange must be contained in the cidr.
+    dynamicRange:
+      startAt: 192.168.77.200
+      endsAt:  192.168.77.225
+  

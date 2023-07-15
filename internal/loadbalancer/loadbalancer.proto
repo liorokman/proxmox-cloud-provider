@@ -1,0 +1,67 @@
+
+syntax = "proto3";
+import "google/protobuf/empty.proto";
+
+option go_package = "github.com/liorokman/proxmox-cloud-provider/internal/loadbalancer";
+
+package loadbalancer;
+
+service LoadBalancer {
+   // Get all information about all defined Load Balancers
+   rpc GetLoadBalancers(google.protobuf.Empty) returns (stream LoadBalancerInformation);
+   // Get information about a specific Load Balancer. If no such name exists, return
+   // an empty structure
+   rpc GetLoadBalancer(LoadBalancerName) returns (LoadBalancerInformation);
+
+   rpc Create(CreateLoadBalancer) returns (LoadBalancerInformation);
+   rpc Delete(LoadBalancerName) returns (Error);
+
+   rpc AddTarget(AddTargetRequest) returns (Error);
+   rpc DelTarget(DelTargetRequest) returns (Error);
+}
+
+enum Protocol {
+   TCP = 0;
+   UDP = 1;
+}
+
+message Error {
+   uint32 Code = 1;
+   string Message = 2;
+}
+
+message LoadBalancerName {
+   string name = 1;
+}
+
+message LoadBalancerInformation {
+   string name = 1;
+   string ip_addr = 2;
+   // Maps a port to a target
+   map<uint32, Target> tcp_targets = 3;
+   map<uint32, Target> udp_targets = 4;
+}
+
+message CreateLoadBalancer {
+   string name = 1;
+   // If an ip_addr is requested, try to use it. Otherwise, an unused IP will be used.
+   optional string ip_addr = 2;
+}
+
+message DelTargetRequest {
+   string lb_name = 1;
+   Protocol protocol = 2; 
+   Target target = 3;
+}
+
+message AddTargetRequest {
+   string lb_name = 1;
+   Protocol protocol = 2; 
+   uint32 srcPort = 3;
+   Target target = 4;
+}
+
+message Target {
+   string dstIP = 2;
+   uint32 dstPort = 3;
+}
