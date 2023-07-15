@@ -4,9 +4,12 @@ import (
 	context "context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
+	"syscall"
 
 	"github.com/knadh/koanf/v2"
+	"github.com/moby/ipvs"
 	"github.com/rosedblabs/rosedb/v2"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
@@ -21,11 +24,13 @@ type loadBalancerServer struct {
 	externalLink netlink.Link
 	ns           netns.NsHandle
 	nlHandle     *netlink.Handle
+	ipvsHandle   *ipvs.Handle
 }
 
 type SingleLoadBalancer struct {
 	Name        string               `json:"name"`
 	IP          net.IP               `json:"ip"`
+	Port        uint16               `json:"port"`
 	TCPMappings map[uint32]ipAndPort `json:"tcp"`
 	UDPMappings map[uint32]ipAndPort `json:"udp"`
 }
@@ -41,6 +46,7 @@ type Intf interface {
 }
 
 func (l *loadBalancerServer) Close() {
+	l.ipvsHandle.Close()
 	l.nlHandle.Delete()
 	l.ns.Close()
 	l.db.Close()
@@ -48,7 +54,7 @@ func (l *loadBalancerServer) Close() {
 
 func NewServer(config *koanf.Koanf) (Intf, error) {
 
-	cidr, err := netlink.ParseAddr(config.MustString("loadbalancer.cidr"))
+	cidr, err := netlink.ParseAddr(config.MustString("loadbalancer.ipam.cidr"))
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +68,13 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		return nil, err
 	}
 	netIf, err := netlinkHandle.LinkByName(config.MustString("loadbalancer.externalInterface"))
+	if err != nil {
+		netlinkHandle.Delete()
+		ns.Close()
+		return nil, err
+	}
+	log.Printf("ExternalIF: %+v\n", netIf)
+	ipvsHandle, err := ipvs.NewInNamespace(ns)
 	if err != nil {
 		netlinkHandle.Delete()
 		ns.Close()
@@ -82,6 +95,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		db:           db,
 		ns:           ns,
 		nlHandle:     netlinkHandle,
+		ipvsHandle:   ipvsHandle,
 	}
 	return lbServer, nil
 }
@@ -104,6 +118,7 @@ func (s SingleLoadBalancer) AsLBInformation() *LoadBalancerInformation {
 	return &LoadBalancerInformation{
 		Name:       s.Name,
 		IpAddr:     s.IP.String(),
+		Port:       uint32(s.Port),
 		TcpTargets: tcpTargets,
 		UdpTargets: udpTargets,
 	}
@@ -146,6 +161,7 @@ func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBala
 
 func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer) (*LoadBalancerInformation, error) {
 
+	log.Printf("Create called: %+v\n", clb)
 	if clb.IpAddr == nil {
 		// TODO: Get the next available IP from IPAM
 		clb.IpAddr = asPtr("192.168.78.30")
@@ -154,6 +170,7 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 	slb := SingleLoadBalancer{
 		Name:        clb.Name,
 		IP:          net.ParseIP(*clb.IpAddr),
+		Port:        uint16(clb.Port),
 		TCPMappings: map[uint32]ipAndPort{},
 		UDPMappings: map[uint32]ipAndPort{},
 	}
@@ -163,31 +180,54 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 		return nil, fmt.Errorf("loadbalancer called %s already exists", clb.Name)
 	}
 
-	// TODO: Actually create a load balancer
-
 	// 1. Create a new alias on the interface that matches the required IP
 	//    There could already be such an interface, since there might be another LB with the same IP and different port
 	requiredAddr := &netlink.Addr{
 		IPNet: &net.IPNet{
-			IP:   net.ParseIP(*clb.IpAddr),
+			IP:   slb.IP,
 			Mask: l.cidr.Mask,
 		},
 	}
-	addrs, err := netlink.AddrList(l.externalLink, netlink.FAMILY_ALL)
-	found := false
+	addrs, err := l.nlHandle.AddrList(l.externalLink, netlink.FAMILY_ALL)
+	addrFound := false
 	for _, addr := range addrs {
-		found = requiredAddr.Equal(addr)
-		if found {
+		log.Printf("Curr addr: %+v\n", addr)
+		addrFound = requiredAddr.Equal(addr)
+		if addrFound {
 			break
 		}
 	}
-	if !found {
-		err = netlink.AddrAdd(l.externalLink, requiredAddr)
+
+	// 2. Create an IPVS service for the ip:port combination
+	srv := &ipvs.Service{
+		Address:       slb.IP,
+		Port:          uint16(clb.Port),
+		AddressFamily: syscall.AF_INET,
+		SchedName:     "rr",
+	}
+	log.Printf("About to check for service: %+v\n", srv)
+	if l.ipvsHandle.IsServicePresent(srv) {
+		return nil, fmt.Errorf("Service is already defined in ipvs")
+	}
+
+	// 3. Actually create everything
+	log.Printf("Required address: %+v, addrFound: %v\n", requiredAddr, addrFound)
+	if !addrFound {
+		err = l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
 		if err != nil {
 			return nil, err
 		}
 	}
-	// 2. Create an IPVS service for the ip:port combination
+	if err = l.ipvsHandle.NewService(srv); err != nil {
+		if !addrFound {
+			// Remove the address that was just added
+			err2 := l.nlHandle.AddrDel(l.externalLink, requiredAddr)
+			if err2 != nil {
+				log.Printf("cleaning up failed: %v", err2)
+			}
+		}
+		return nil, err
+	}
 
 	slbData, err := json.Marshal(slb)
 	if err != nil {

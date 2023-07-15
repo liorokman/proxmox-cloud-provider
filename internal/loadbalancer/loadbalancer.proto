@@ -37,15 +37,17 @@ message LoadBalancerName {
 message LoadBalancerInformation {
    string name = 1;
    string ip_addr = 2;
+   uint32 port = 3;
    // Maps a port to a target
-   map<uint32, Target> tcp_targets = 3;
-   map<uint32, Target> udp_targets = 4;
+   map<uint32, Target> tcp_targets = 4;
+   map<uint32, Target> udp_targets = 5;
 }
 
 message CreateLoadBalancer {
    string name = 1;
-   // If an ip_addr is requested, try to use it. Otherwise, an unused IP will be used.
-   optional string ip_addr = 2;
+   uint32 port = 3;
+   // If an ip_addr is requested, try to use it. Otherwise, an unused IP will be allocated.
+   optional string ip_addr = 4;
 }
 
 message DelTargetRequest {

@@ -33,7 +33,3 @@ func TestCreateLB(t *testing.T) {
 	}
 	fmt.Printf("%+v\n", lbi)
 }
-
-func asPtr[T any](s T) *T {
-	return &s
-}
