@@ -2,33 +2,67 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"io"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/liorokman/proxmox-cloud-provider/internal/loadbalancer"
 )
 
 var (
+	clientCert = flag.String("cert", "", "filename containing the client certificate")
+	clientKey  = flag.String("key", "", "filename containing the client certificate private key")
+	caFile     = flag.String("ca", "", "filename containing the CA that can verify the server")
+
 	serverAddr = flag.String("addr", "localhost:9999", "server address")
 	name       = flag.String("name", "", "service name")
 	op         = flag.String("op", "addSrv", "addSrv, delSrv, addTgt, delTgt, list")
 
-	service  = flag.String("srv", "192.168.87.33:80", "in {add,del}Srv - service ip, in {add,del}Tgt - target ip")
+	service  = flag.String("srv", "", "in {add,del}Srv - service ip, in {add,del}Tgt - target ip")
 	protocol = flag.Bool("tcp", true, "true == TCP, false == UDP")
 	dstPort  = flag.Int("port", 0, "destination port")
 )
 
+func loadKeypair() (credentials.TransportCredentials, error) {
+	if *clientKey == "" {
+		clientKey = clientCert
+	}
+	cert, err := tls.LoadX509KeyPair(*clientCert, *clientKey)
+	if err != nil {
+		return nil, err
+	}
+	ca, err := os.ReadFile(*caFile)
+	if err != nil {
+		return nil, err
+	}
+	capool := x509.NewCertPool()
+	if !capool.AppendCertsFromPEM(ca) {
+		return nil, err
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      capool,
+	}), nil
+}
+
 func main() {
 	flag.Parse()
+
+	creds, err := loadKeypair()
+	if err != nil {
+		panic(err)
+	}
 	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 	}
 	conn, err := grpc.Dial(*serverAddr, opts...)
 	if err != nil {

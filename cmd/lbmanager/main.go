@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +13,7 @@ import (
 	"github.com/knadh/koanf/v2"
 	"github.com/liorokman/proxmox-cloud-provider/internal/loadbalancer"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 var k = koanf.New(".")
@@ -59,7 +62,35 @@ func loadConfigFile(configFile string) error {
 	return nil
 }
 
+func newGRPCCreds(certFile, keyFile, caFile string) (credentials.TransportCredentials, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(caFile)
+	if err != nil {
+		return nil, err
+	}
+	capool := x509.NewCertPool()
+	if !capool.AppendCertsFromPEM(data) {
+		return nil, err
+	}
+	return credentials.NewTLS(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    capool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}), nil
+}
+
 func main() {
+
+	creds, err := newGRPCCreds(k.MustString("grpc.auth.cert"),
+		k.MustString("grpc.auth.key"),
+		k.MustString("grpc.auth.ca"))
+	if err != nil {
+		log.Fatalf("error initializing TLS: %v", err)
+	}
 
 	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", k.MustString("grpc.listen"), k.MustInt("grpc.port")))
 	if err != nil {
@@ -69,7 +100,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed starting the loadbalancer manager: %v", err)
 	}
-	var opts []grpc.ServerOption
+	opts := []grpc.ServerOption{
+		grpc.Creds(creds),
+	}
+
 	grpcServer := grpc.NewServer(opts...)
 	loadbalancer.RegisterLoadBalancerServer(grpcServer, lbServer)
 	log.Println("Listening...")

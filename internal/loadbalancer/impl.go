@@ -14,18 +14,21 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
+
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipam"
 )
 
 // Error codes that can appear in the Error.Code field
 const (
-	ErrSuccess              = 0b0000000
-	ErrNoSuchLB             = 0b0000001
-	ErrNoSuchService        = 0b0000010
-	ErrNoSuchIP             = 0b0000100
-	ErrAddDestinationFailed = 0b0001000
-	ErrDelDestinationFailed = 0b0010000
-	ErrTargetAlreadyMapped  = 0b0100000
-	ErrTargetNotMapped      = 0b1000000
+	ErrSuccess              = 0
+	ErrNoSuchLB             = (1 << 0)
+	ErrNoSuchService        = (1 << 1)
+	ErrNoSuchIP             = (1 << 2)
+	ErrAddDestinationFailed = (1 << 3)
+	ErrDelDestinationFailed = (1 << 4)
+	ErrTargetAlreadyMapped  = (1 << 5)
+	ErrTargetNotMapped      = (1 << 6)
+	ErrIPAMError            = (1 << 7)
 )
 
 var (
@@ -41,6 +44,7 @@ type loadBalancerServer struct {
 	ns           netns.NsHandle
 	nlHandle     *netlink.Handle
 	ipvsHandle   *ipvs.Handle
+	ipam         ipam.IPAM
 }
 
 type SingleLoadBalancer struct {
@@ -95,6 +99,15 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 	// open a database
 	db, err := rosedb.Open(options)
 	if err != nil {
+		ipvsHandle.Close()
+		netlinkHandle.Delete()
+		ns.Close()
+		return nil, err
+	}
+	ipManagement, err := ipam.New(config, netlinkHandle, netIf)
+	if err != nil {
+		db.Close()
+		ipvsHandle.Close()
 		netlinkHandle.Delete()
 		ns.Close()
 		return nil, err
@@ -106,6 +119,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		ns:           ns,
 		nlHandle:     netlinkHandle,
 		ipvsHandle:   ipvsHandle,
+		ipam:         ipManagement,
 	}
 	return lbServer, nil
 }
@@ -185,16 +199,19 @@ func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBala
 
 func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer) (*LoadBalancerInformation, error) {
 
-	if clb.IpAddr == nil {
-		// TODO: Get the next available IP from IPAM
-		clb.IpAddr = asPtr("192.168.78.30")
-	}
+	log.Printf("Incoming request: %+v", clb)
 	if _, err := l.db.Get([]byte(clb.Name)); err != nil && err != rosedb.ErrKeyNotFound {
 		return nil, err
 	} else if err == nil {
 		return nil, fmt.Errorf("loadbalancer called %s already exists", clb.Name)
 	}
-	// TODO: Verify that clb.IpAddr is contained in the current configured CIDR
+	if clb.IpAddr == nil || *clb.IpAddr == "" {
+		nextIP, err := l.ipam.Allocate()
+		if err != nil {
+			return nil, err
+		}
+		clb.IpAddr = asPtr(nextIP.String())
+	}
 
 	slb := SingleLoadBalancer{
 		Name:     clb.Name,
@@ -204,6 +221,11 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 		Mappings: map[uint32]net.IP{},
 	}
 	log.Printf("slb is %+v", slb)
+
+	if !l.ipam.Contains(slb.IP) {
+		return nil, fmt.Errorf("Requested IP %s is not contained in the configured CIDR (%s)", *clb.IpAddr, l.cidr)
+	}
+
 	// 1. Create a new alias on the interface that matches the required IP
 	//    There could already be such an interface, since there might be another LB with the same IP and different port
 	requiredAddr := &netlink.Addr{
@@ -294,6 +316,11 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 			log.Printf("error removing the ip alias: %+v", err)
 			retErr.Message = retErr.Message + "\n" + err.Error()
 			retErr.Code |= ErrNoSuchIP
+		}
+		if err := l.ipam.Release(addrToDelete.IP); err != nil {
+			log.Printf("error unallocating the ip from ipam: %+v", err)
+			retErr.Message = retErr.Message + "\n" + err.Error()
+			retErr.Code |= ErrIPAMError
 		}
 	}
 

@@ -1,6 +1,10 @@
 grpc:
   listen: 0.0.0.0
   port: 9999
+  auth:
+    key: certs/lbmanager-dev.pem
+    cert: certs/lbmanager-dev.pem
+    ca: certs/ca.pem
 dbDir: /tmp/db
 loadbalancer:
   namespace: LB
@@ -18,5 +22,5 @@ loadbalancer:
     # The entire dynamicRange must be contained in the cidr.
     dynamicRange:
       startAt: 192.168.87.200
-      endsAt:  192.168.87.225
+      endAt:  192.168.87.225
   
