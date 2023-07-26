@@ -186,12 +186,8 @@ func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalan
 // Get information about a specific Load Balancer
 func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBalancerName) (*LoadBalancerInformation, error) {
 
-	slb, err := l.db.Get([]byte(name.Name))
-	if err != nil {
-		return nil, err
-	}
-	var curr SingleLoadBalancer
-	if err := json.Unmarshal(slb, &curr); err != nil {
+	curr, err := l.getSLB(name.Name)
+	if err != nil && err != errNoSuchLoadbalancer {
 		return nil, err
 	}
 	return curr.AsLBInformation(), nil
