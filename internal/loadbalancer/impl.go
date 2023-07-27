@@ -47,14 +47,6 @@ type loadBalancerServer struct {
 	ipam         ipam.IPAM
 }
 
-type SingleLoadBalancer struct {
-	Name     string            `json:"name"`
-	IP       net.IP            `json:"ip"`
-	Port     uint16            `json:"port"`
-	Protocol Protocol          `json:"protocol"`
-	Mappings map[uint32]net.IP `json:"mappings"`
-}
-
 type Intf interface {
 	LoadBalancerServer
 	Close()
@@ -124,39 +116,20 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 	return lbServer, nil
 }
 
-func (s SingleLoadBalancer) AsLBInformation() *LoadBalancerInformation {
-	targets := make([]*Target, len(s.Mappings))
-	count := 0
-	for k, v := range s.Mappings {
-		targets[count] = &Target{
-			DstIP:   v.String(),
-			DstPort: k,
-		}
-		count++
-	}
-
-	return &LoadBalancerInformation{
-		Name:     s.Name,
-		IpAddr:   s.IP.String(),
-		Port:     uint32(s.Port),
-		Protocol: s.Protocol,
-		Targets:  targets,
-	}
-}
-
-func (s SingleLoadBalancer) toIPVSService() *ipvs.Service {
+func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol) *ipvs.Service {
+	srcIP := net.ParseIP(l.IpAddr)
 	var fam uint16 = syscall.AF_INET
-	if s.IP.To4() == nil {
+	if srcIP.To4() == nil {
 		fam = syscall.AF_INET6
 	}
-	var protocol uint16 = syscall.IPPROTO_TCP
-	if s.Protocol == Protocol_UDP {
-		protocol = syscall.IPPROTO_UDP
+	var p uint16 = syscall.IPPROTO_TCP
+	if protocol == Protocol_UDP {
+		p = syscall.IPPROTO_UDP
 	}
 	return &ipvs.Service{
-		Address:       s.IP,
-		Port:          s.Port,
-		Protocol:      protocol,
+		Address:       srcIP,
+		Port:          uint16(srcPort),
+		Protocol:      p,
 		AddressFamily: fam,
 		SchedName:     "rr",
 	}
@@ -172,11 +145,11 @@ func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalan
 		if err != nil {
 			return err
 		}
-		var curr SingleLoadBalancer
+		var curr LoadBalancerInformation
 		if err := json.Unmarshal(val, &curr); err != nil {
 			return err
 		}
-		if err := stream.Send(curr.AsLBInformation()); err != nil {
+		if err := stream.Send(&curr); err != nil {
 			return err
 		}
 	}
@@ -186,11 +159,11 @@ func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalan
 // Get information about a specific Load Balancer
 func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBalancerName) (*LoadBalancerInformation, error) {
 
-	curr, err := l.getSLB(name.Name)
+	curr, err := l.getLB(name.Name)
 	if err != nil && err != errNoSuchLoadbalancer {
-		return nil, err
+		return &LoadBalancerInformation{}, err
 	}
-	return curr.AsLBInformation(), nil
+	return curr, nil
 }
 
 func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer) (*LoadBalancerInformation, error) {
@@ -209,16 +182,15 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 		clb.IpAddr = asPtr(nextIP.String())
 	}
 
-	slb := SingleLoadBalancer{
-		Name:     clb.Name,
-		IP:       net.ParseIP(*clb.IpAddr),
-		Port:     uint16(clb.Port),
-		Protocol: clb.Protocol,
-		Mappings: map[uint32]net.IP{},
+	lbInfo := &LoadBalancerInformation{
+		Name:    clb.Name,
+		IpAddr:  *clb.IpAddr,
+		Targets: map[int32]*TargetList{},
 	}
-	log.Printf("slb is %+v", slb)
+	log.Printf("slb is %+v", lbInfo)
 
-	if !l.ipam.Contains(slb.IP) {
+	externalIP := net.ParseIP(lbInfo.IpAddr)
+	if !l.ipam.Contains(externalIP) {
 		return nil, fmt.Errorf("Requested IP %s is not contained in the configured CIDR (%s)", *clb.IpAddr, l.cidr)
 	}
 
@@ -226,7 +198,7 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 	//    There could already be such an interface, since there might be another LB with the same IP and different port
 	requiredAddr := &netlink.Addr{
 		IPNet: &net.IPNet{
-			IP:   slb.IP,
+			IP:   externalIP,
 			Mask: l.cidr.Mask,
 		},
 	}
@@ -238,41 +210,23 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 			break
 		}
 	}
-
-	// 2. Create an IPVS service for the ip:port combination
-	srv := slb.toIPVSService()
-	if l.ipvsHandle.IsServicePresent(srv) {
-		return nil, fmt.Errorf("Service is already defined in ipvs")
-	}
-
-	// 3. Actually create everything
 	if !addrFound {
 		err = l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if err = l.ipvsHandle.NewService(srv); err != nil {
-		if !addrFound {
-			// Remove the address that was just added
-			err2 := l.nlHandle.AddrDel(l.externalLink, requiredAddr)
-			if err2 != nil {
-				log.Printf("cleaning up failed: %v", err2)
-			}
-		}
-		return nil, err
-	}
 
-	slbData, err := json.Marshal(slb)
+	lbInfoData, err := json.Marshal(lbInfo)
 	if err != nil {
 		return nil, err
 	}
-	err = l.db.Put([]byte(clb.Name), slbData)
-	return slb.AsLBInformation(), err
+	err = l.db.Put([]byte(clb.Name), lbInfoData)
+	return lbInfo, err
 }
 
 func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerName) (*Error, error) {
-	slb, err := l.getSLB(lbName.Name)
+	lbInfo, err := l.getLB(lbName.Name)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {
 			return &Error{Message: fmt.Sprintf("no such loadbalancer %s", lbName.Name), Code: ErrNoSuchLB}, nil
@@ -282,42 +236,38 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 
 	retErr := &Error{}
 	// 1. Remove the IPVS service
-	srv := slb.toIPVSService()
-	if err := l.ipvsHandle.DelService(srv); err != nil {
-		log.Printf("Error removing the ipvs service: %+v", err)
-		retErr.Message = err.Error()
-		retErr.Code = ErrNoSuchService
+	for port, target := range lbInfo.Targets {
+		protocols := map[Protocol]byte{}
+		for _, v := range target.Target {
+			protocols[v.Protocol] = 0
+		}
+		for p, _ := range protocols {
+			srv := toIPVSService(lbInfo, port, p)
+			if err := l.ipvsHandle.DelService(srv); err != nil {
+				log.Printf("Error removing the ipvs service: %+v", err)
+				retErr.Message = err.Error()
+				retErr.Code = ErrNoSuchService
+			}
+		}
 	}
 
-	// 2. If there are no other IPVS services using this IP address, remove the IP alias
-	allServices, err := l.ipvsHandle.GetServices()
-	if err != nil {
-		return nil, err
+	externalIP := net.ParseIP(lbInfo.IpAddr)
+	// 2. remove the IP alias
+	addrToDelete := &netlink.Addr{
+		IPNet: &net.IPNet{
+			IP:   externalIP,
+			Mask: l.cidr.Mask,
+		},
 	}
-	stillUsed := false
-	for _, currSrv := range allServices {
-		if srv.Address.Equal(currSrv.Address) {
-			stillUsed = true
-			break
-		}
+	if err := l.nlHandle.AddrDel(l.externalLink, addrToDelete); err != nil {
+		log.Printf("error removing the ip alias: %+v", err)
+		retErr.Message = retErr.Message + "\n" + err.Error()
+		retErr.Code |= ErrNoSuchIP
 	}
-	if !stillUsed {
-		addrToDelete := &netlink.Addr{
-			IPNet: &net.IPNet{
-				IP:   slb.IP,
-				Mask: l.cidr.Mask,
-			},
-		}
-		if err := l.nlHandle.AddrDel(l.externalLink, addrToDelete); err != nil {
-			log.Printf("error removing the ip alias: %+v", err)
-			retErr.Message = retErr.Message + "\n" + err.Error()
-			retErr.Code |= ErrNoSuchIP
-		}
-		if err := l.ipam.Release(addrToDelete.IP); err != nil {
-			log.Printf("error unallocating the ip from ipam: %+v", err)
-			retErr.Message = retErr.Message + "\n" + err.Error()
-			retErr.Code |= ErrIPAMError
-		}
+	if err := l.ipam.Release(addrToDelete.IP); err != nil {
+		log.Printf("error unallocating the ip from ipam: %+v", err)
+		retErr.Message = retErr.Message + "\n" + err.Error()
+		retErr.Code |= ErrIPAMError
 	}
 
 	if err := l.db.Delete([]byte(lbName.Name)); err != nil {
@@ -328,18 +278,29 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 }
 
 func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetRequest) (*Error, error) {
-	slb, err := l.getSLB(atr.LbName)
+	lbInfo, err := l.getLB(atr.LbName)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {
 			return &Error{Message: fmt.Sprintf("no such loadbalancer %s", atr.LbName), Code: ErrNoSuchLB}, nil
 		}
 		return nil, err
 	}
-	if _, found := slb.Mappings[atr.Target.DstPort]; found {
-		return &Error{
-			Message: fmt.Sprintf("target %+v already mapped to load balancer %s", atr.Target, atr.LbName),
-			Code:    ErrTargetAlreadyMapped,
-		}, nil
+	targetList, found := lbInfo.Targets[atr.SrcPort]
+	if !found || targetList == nil {
+		targetList = &TargetList{
+			Target: []*Target{},
+		}
+	}
+	for _, target := range targetList.Target {
+		if target.Protocol == atr.Target.Protocol &&
+			target.DstIP == atr.Target.DstIP &&
+			target.DstPort == atr.Target.DstPort {
+
+			return &Error{
+				Message: fmt.Sprintf("target %+v already mapped to load balancer %s", atr.Target, atr.LbName),
+				Code:    ErrTargetAlreadyMapped,
+			}, nil
+		}
 	}
 
 	targetIP := net.ParseIP(atr.Target.DstIP)
@@ -347,7 +308,12 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 	if targetIP.To4() == nil {
 		fam = syscall.AF_INET6
 	}
-	srv := slb.toIPVSService()
+	srv := toIPVSService(lbInfo, atr.SrcPort, atr.Target.Protocol)
+	if !l.ipvsHandle.IsServicePresent(srv) {
+		if err = l.ipvsHandle.NewService(srv); err != nil {
+			return nil, err
+		}
+	}
 	newDestination := &ipvs.Destination{
 		Address:         targetIP,
 		Port:            uint16(atr.Target.DstPort),
@@ -356,15 +322,16 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 		Weight:          1,
 	}
 	if err := l.ipvsHandle.NewDestination(srv, newDestination); err != nil {
-		log.Printf("error adding a new destination %+v to service %+v: %+v", atr.Target, slb, err)
+		log.Printf("error adding a new destination %+v to service %+v: %+v", atr.Target, lbInfo, err)
 		return &Error{
 			Message: err.Error(),
 			Code:    ErrAddDestinationFailed,
 		}, nil
 	}
-	slb.Mappings[atr.Target.DstPort] = targetIP
+	targetList.Target = append(targetList.Target, atr.Target)
+	lbInfo.Targets[atr.SrcPort] = targetList
 
-	slbData, err := json.Marshal(slb)
+	slbData, err := json.Marshal(lbInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -375,43 +342,76 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 }
 
 func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetRequest) (*Error, error) {
-	slb, err := l.getSLB(dtr.LbName)
+	lbInfo, err := l.getLB(dtr.LbName)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {
 			return &Error{Message: fmt.Sprintf("no such loadbalancer %s", dtr.LbName), Code: ErrNoSuchLB}, nil
 		}
 		return nil, err
 	}
-	if _, found := slb.Mappings[dtr.Target.DstPort]; !found {
+	targetList, found := lbInfo.Targets[dtr.SrcPort]
+	if !found || targetList == nil {
 		return &Error{
 			Message: fmt.Sprintf("target %+v not mapped to load balancer %s", dtr.Target, dtr.LbName),
 			Code:    ErrTargetNotMapped,
 		}, nil
 	}
+	targetToRemove := -1
+	for target, _ := range targetList.Target {
+		if targetList.Target[target].Protocol == dtr.Target.Protocol &&
+			targetList.Target[target].DstIP == dtr.Target.DstIP &&
+			targetList.Target[target].DstPort == dtr.Target.DstPort {
+
+			targetToRemove = target
+			break
+		}
+	}
+	if targetToRemove == -1 {
+		return &Error{
+			Message: fmt.Sprintf("target %+v not mapped to load balancer %s on port %d", dtr.Target, dtr.LbName, dtr.SrcPort),
+			Code:    ErrTargetNotMapped,
+		}, nil
+	}
+
+	target := targetList.Target[targetToRemove]
 
 	targetIP := net.ParseIP(dtr.Target.DstIP)
 	var fam uint16 = syscall.AF_INET
 	if targetIP.To4() == nil {
 		fam = syscall.AF_INET6
 	}
-	srv := slb.toIPVSService()
+	srv := toIPVSService(lbInfo, dtr.SrcPort, target.Protocol)
 	dest := &ipvs.Destination{
 		Address:         targetIP,
-		Port:            uint16(dtr.Target.DstPort),
+		Port:            uint16(target.DstPort),
 		ConnectionFlags: ipvs.ConnFwdMasq,
 		AddressFamily:   fam,
 		Weight:          1,
 	}
 	if err := l.ipvsHandle.DelDestination(srv, dest); err != nil {
-		log.Printf("error removing a destination %+v from service %+v: %+v", dtr.Target, slb, err)
+		log.Printf("error removing a destination %+v from service %+v: %+v", dtr.Target, lbInfo, err)
 		return &Error{
 			Message: err.Error(),
 			Code:    ErrDelDestinationFailed,
 		}, nil
 	}
-	delete(slb.Mappings, dtr.Target.DstPort)
+	targetList.Target = append(targetList.Target[:targetToRemove], targetList.Target[targetToRemove+1:]...)
 
-	slbData, err := json.Marshal(slb)
+	if len(targetList.Target) == 0 {
+		// Delete the service
+		if err := l.ipvsHandle.DelService(srv); err != nil {
+			log.Printf("error removing a destination %+v from service %+v: %+v", dtr.Target, lbInfo, err)
+			return &Error{
+				Message: err.Error(),
+				Code:    ErrDelDestinationFailed,
+			}, nil
+		}
+		delete(lbInfo.Targets, dtr.SrcPort)
+	} else {
+		lbInfo.Targets[dtr.SrcPort] = targetList
+	}
+
+	slbData, err := json.Marshal(lbInfo)
 	if err != nil {
 		return nil, err
 	}
@@ -421,19 +421,22 @@ func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetReques
 	return &Error{}, nil
 }
 
-func (l *loadBalancerServer) getSLB(name string) (SingleLoadBalancer, error) {
-	slbRaw, err := l.db.Get([]byte(name))
+func (l *loadBalancerServer) getLB(name string) (*LoadBalancerInformation, error) {
+	lbinfoRaw, err := l.db.Get([]byte(name))
 	if err != nil {
 		if err == rosedb.ErrKeyNotFound {
-			return SingleLoadBalancer{}, errNoSuchLoadbalancer
+			return nil, errNoSuchLoadbalancer
 		}
-		return SingleLoadBalancer{}, err
+		return nil, err
 	}
-	var slb SingleLoadBalancer
-	if err := json.Unmarshal(slbRaw, &slb); err != nil {
-		return SingleLoadBalancer{}, err
+	var lbInfo LoadBalancerInformation
+	if err := json.Unmarshal(lbinfoRaw, &lbInfo); err != nil {
+		return nil, err
 	}
-	return slb, nil
+	if lbInfo.Targets == nil {
+		lbInfo.Targets = map[int32]*TargetList{}
+	}
+	return &lbInfo, nil
 }
 
 func asPtr[T any](s T) *T {

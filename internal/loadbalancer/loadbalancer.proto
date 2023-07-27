@@ -37,30 +37,33 @@ message LoadBalancerName {
 message LoadBalancerInformation {
    string name = 1;
    string ip_addr = 2;
-   uint32 port = 3;
-   Protocol protocol = 4;
-   repeated Target targets = 5;
+   map<int32,TargetList> targets = 3;
 }
 
 message CreateLoadBalancer {
    string name = 1;
-   Protocol protocol = 2; 
-   uint32 port = 3;
    // If an ip_addr is requested, try to use it. Otherwise, an unused IP will be allocated.
-   optional string ip_addr = 4;
+   optional string ip_addr = 2;
 }
 
 message DelTargetRequest {
    string lb_name = 1;
-   Target target = 2;
+   int32 srcPort = 2;
+   Target target = 3;
 }
 
 message AddTargetRequest {
    string lb_name = 1;
-   Target target = 2;
+   int32 srcPort = 2;
+   Target target = 3;
 }
 
 message Target {
+   Protocol protocol = 1;
    string dstIP = 2;
-   uint32 dstPort = 3;
+   int32 dstPort = 3;
+}
+
+message TargetList {
+   repeated Target target = 1;
 }

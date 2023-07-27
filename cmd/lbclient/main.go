@@ -8,8 +8,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strconv"
-	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -29,7 +27,8 @@ var (
 
 	service  = flag.String("srv", "", "in {add,del}Srv - service ip, in {add,del}Tgt - target ip")
 	protocol = flag.Bool("tcp", true, "true == TCP, false == UDP")
-	dstPort  = flag.Int("port", 0, "destination port")
+	dstPort  = flag.Int("dport", 8080, "destination port")
+	srcPort  = flag.Int("sport", 8080, "source port")
 )
 
 func loadKeypair() (credentials.TransportCredentials, error) {
@@ -79,16 +78,9 @@ func main() {
 
 	switch *op {
 	case "addSrv":
-		parts := strings.Split(*service, ":")
-		port, err := strconv.Atoi(parts[1])
-		if err != nil {
-			log.Fatalf("malformed port: %s", parts[1])
-		}
 		clb := &loadbalancer.CreateLoadBalancer{
-			Name:     *name,
-			Port:     uint32(port),
-			Protocol: p,
-			IpAddr:   asPtr(parts[0]),
+			Name:   *name,
+			IpAddr: service,
 		}
 		log.Printf("requested: %+v", clb)
 		lbInfo, err := client.Create(context.Background(), clb)
@@ -111,10 +103,12 @@ func main() {
 		}
 	case "addTgt":
 		ret, err := client.AddTarget(context.Background(), &loadbalancer.AddTargetRequest{
-			LbName: *name,
+			LbName:  *name,
+			SrcPort: int32(*srcPort),
 			Target: &loadbalancer.Target{
-				DstIP:   *service,
-				DstPort: uint32(*dstPort),
+				DstIP:    *service,
+				DstPort:  int32(*dstPort),
+				Protocol: p,
 			},
 		})
 		if err != nil {
@@ -127,10 +121,12 @@ func main() {
 		}
 	case "delTgt":
 		ret, err := client.DelTarget(context.Background(), &loadbalancer.DelTargetRequest{
-			LbName: *name,
+			LbName:  *name,
+			SrcPort: int32(*srcPort),
 			Target: &loadbalancer.Target{
-				DstIP:   *service,
-				DstPort: uint32(*dstPort),
+				DstIP:    *service,
+				DstPort:  int32(*dstPort),
+				Protocol: p,
 			},
 		})
 		if err != nil {
@@ -160,8 +156,4 @@ func main() {
 	default:
 		log.Fatalf("Unknown operation %s", *op)
 	}
-}
-
-func asPtr[T any](t T) *T {
-	return &t
 }
