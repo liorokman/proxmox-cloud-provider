@@ -9,13 +9,13 @@ import (
 	"syscall"
 
 	"github.com/knadh/koanf/v2"
-	"github.com/moby/ipvs"
 	"github.com/rosedblabs/rosedb/v2"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/liorokman/proxmox-cloud-provider/internal/ipam"
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvs"
 )
 
 // Error codes that can appear in the Error.Code field
