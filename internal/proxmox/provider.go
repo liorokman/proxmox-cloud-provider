@@ -20,6 +20,7 @@ import (
 type Provider struct {
 	config    ProviderConfig
 	lbManager *LoadBalancer
+	instances cloudprovider.InstancesV2
 }
 
 var _ cloudprovider.Interface = &Provider{}
@@ -30,9 +31,10 @@ func init() {
 
 // ProviderConfig contains the configuration values required by the proxmox provider
 type ProviderConfig struct {
-	Security    Security `yaml:"security"`
-	ManagerHost string   `yaml:"managerHost"`
-	ManagerPort int      `yaml:"managerPort"`
+	Security      Security      `yaml:"security"`
+	ManagerHost   string        `yaml:"managerHost"`
+	ManagerPort   int           `yaml:"managerPort"`
+	ClusterConfig ClusterConfig `yaml:"proxmoxConfig"`
 }
 
 // Security contains the mTLS configuration for connecting to the loadbalancer manager
@@ -40,6 +42,16 @@ type Security struct {
 	CertFile string `yaml:"cert"`
 	KeyFile  string `yaml:"key"`
 	CAFile   string `yaml:"ca"`
+}
+
+// ClusterConfig contains the proxmox cluster configuration information
+type ClusterConfig struct {
+	URL         string `yaml:"url"`
+	Timeout     int    `yaml:"timeout"`
+	APIToken    string `yaml:"apiToken"`
+	Username    string `yaml:"username"`
+	InsecureTLS bool   `yaml:"insecureTLS"`
+	CACert      string `yaml:"caCert"`
 }
 
 // New returns a new instance of the proxmox cloud provider
@@ -63,7 +75,13 @@ func New(config io.Reader) (cloudprovider.Interface, error) {
 // to perform housekeeping or run custom controllers specific to the cloud provider.
 // Any tasks started here should be cleaned up when the stop channel closes.
 func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilder, stop <-chan struct{}) {
-	// TODO: add a goroutine that will stop the client when the provider needs to stop
+
+	instances, err := newInstances(p.config.ClusterConfig)
+	if err != nil {
+		log.Fatalf("failed to connect to proxmox: %s", err.Error())
+	}
+	p.instances = instances
+
 	creds, err := loadKeypair(p.config.Security)
 	if err != nil {
 		log.Fatalf("failed to load the lbmanager credentials: %s", err.Error())
@@ -79,7 +97,6 @@ func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilde
 	p.lbManager = &LoadBalancer{
 		client: loadbalancer.NewLoadBalancerClient(conn),
 	}
-
 	go func() {
 		<-stop
 		conn.Close()
@@ -101,7 +118,7 @@ func (p *Provider) Instances() (cloudprovider.Instances, bool) {
 // API calls to the cloud provider when registering and syncing nodes. Implementation of this interface will
 // disable calls to the Zones interface. Also returns true if the interface is supported, false otherwise.
 func (p *Provider) InstancesV2() (cloudprovider.InstancesV2, bool) {
-	return nil, false
+	return p.instances, true
 }
 
 // Zones returns a zones interface. Also returns true if the interface is supported, false otherwise.

@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/moby/ipvs/ns"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
+
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvs/ns"
 )
 
 var (
