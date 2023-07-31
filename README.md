@@ -151,6 +151,8 @@ This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
 
 ## Configure Kubeadm and create the cluster
 
+## Finalize the loadbalancer configuration
+
 ## Create additional master nodes
 
 ## Create worker nodes
