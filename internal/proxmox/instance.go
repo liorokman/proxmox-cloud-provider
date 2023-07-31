@@ -192,8 +192,8 @@ func (i *Instances) getVMRef(ctx context.Context, node *v1.Node) (*proxmox.VmRef
 		if providerURL, err := url.Parse(node.Spec.ProviderID); err == nil {
 			parts := strings.Split(providerURL.Path, "/")
 			// The expected format is "/node name/vm id"
-			if len(parts) == 2 {
-				if id, err := strconv.Atoi(parts[1]); err == nil {
+			if len(parts) == 3 {
+				if id, err := strconv.Atoi(parts[2]); err == nil {
 					vmRef = proxmox.NewVmRef(id)
 				} else {
 					log.Printf("ignoring invalid providerID: %s, id part is not numeric: %s", node.Spec.ProviderID, err.Error())
