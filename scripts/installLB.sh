@@ -24,7 +24,7 @@ writeFile() {
 # Install the necessary tools
 apt-get -y update
 apt-get -y upgrade
-apt-get -y install ipvsadm iptables jq bridge-utils wget
+apt-get -y install ipvsadm iptables jq bridge-utils wget golang-cfssl
 
 # Create the required network environment:
 # 1. Create a new namespace for the LB
@@ -66,10 +66,28 @@ ip netns exec LB sysctl net.ipv4.ip_forward=1
 # 8. Setup SNAT so this container can serve as an internet gateway
 ip netns exec LB iptables -t nat -A POSTROUTING -o external0 -j SNAT --to-source $ext_ip
 
-# 9. Install lbmanager 
+# 9. Setup a CA for lbmanager
+mkdir -p /var/lib/lbmanagerca
+if [ ! -f /var/lib/lbmanagerca/ca.pem ]; then
+  plain_ip=\$(echo \$ETH0_ADDR | cut -f1 -d/)
+  pushd /var/lib/lbmanagerca > /dev/null
+  echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"HomeLab","CN":"Root LB CA"}]}' | \
+        cfssl genkey -initca - | \
+        cfssljson -bare ca
+  echo "{\"hosts\": [\"\$plain_ip\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":"Homelab\",\"CN\":\"\$plain_ip\"}]}" | \
+        cfssl gencert -ca ca.pem  -ca-key ca-key.pem  -  | \
+        cfssljson -bare lbmanager
+  popd > /dev/null
+fi
+
+# 10. Install lbmanager 
 wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbmanager
 chmod +x /usr/local/bin/lbmanager 
-mkdir -p /etc/lbmanager 
+mkdir -p /etc/lbmanager
+cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
+cp /var/lib/lbmanagerca/lbmanager-key.pem /etc/lbmanager/key.pem
+cp /var/lib/lbmanagerca/ca.pem /etc/lbmanager/ca.pem
+
 cat > /etc/lbmanager/lbmanager.yaml << END
 ---
 grpc:
@@ -86,11 +104,10 @@ loadbalancer:
   internalInterface: eth1
   ipam:
     cidr: $ext_ip/$ext_mask
-  dynamicRange:
-    startAt: $ext_start
-    endAt: $ext_end
+    dynamicRange:
+      startAt: $ext_start
+      endAt: $ext_end
 END
-
 
 cat > /etc/systemd/system/lbmanager.service << END
 [Unit]
@@ -102,13 +119,12 @@ ExecStart=/usr/local/bin/lbmanager
 Restart=on-failure
 
 [Install]
-WantedBy=multi-user.target
 Alias=lbmanager.service
 
 END
 
 systemctl daemon-reload
-systemctl enable lbmanager
+systemctl start lbmanager
 
 
 EOF
