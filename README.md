@@ -127,33 +127,102 @@ will be fixed in future versions of this project.
       pct start 1100
    ```
 
-At this point the load balancer container will not yet start to work since the
-configuration is not complete. The mTLS configuration for allowing the provider
-to authenticate to the loadbalancer manager will be added in a later step.
-
 ## Prepare a VM Template for Kubernetes Nodes
-
 
 Follow the instructions in [this](https://github.com/liorokman/packer-Debian#use-in-proxmox)
 github repository to prepare a template that can be used for creating Kubernetes nodes.
 
 This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
 
-## Create the first node
+## Create and start the first node 
 
 1. Clone the template
+
+   Choose an unused ID for the new VM. This section of the README assumes `$K8S_NEW_ID` is 
+   set to to the ID.
+
+   ```bash
+   qm clone $K8S_TEMPLATE_ID $K8S_NEW_ID -full -name k8s-master1 -storage $STORAGE
+   ```
+
 1. Update the cloud-init parameters
    1. Set a valid ssh key for the `debian` user
+
+   ```bash
+   qm set $K8S_NEW_ID -sshkeys /path/to/ssh/public/key/file
+   ```
+
    1. Set a valid IP address. The default gateway should be the loadbalancer's
       ip in the `k8s` subnet.
+
+   ```bash
+   qm set $K8S_NEW_ID -ipconfig0 ip=192.168.50.3/24,gw=192.168.50.1
+   ```
 1. Regenerate the cloud-init volume
+
+   ```bash
+   qm cloudinit update $K8S_NEW_ID
+   ```
+
 1. Resize the disk to at least 20Gb
 
-## Configure Kubeadm and create the cluster
+   ```bash
+   qm disk resize $K8S_NEW_ID virtio0 20G
+   ```
+
+1. Start the vm
+
+   ```bash
+   qm start $K8S_NEW_ID
+   ```
 
 ## Finalize the loadbalancer configuration
 
-## Create additional master nodes
+Enter the loadbalancer container and:
 
-## Create worker nodes
+1. Configure a loadbalancer that reaches the master node's API server.
+
+```bash
+pct enter 1100
+/usr/local/bin/lbctl -addr 192.168.50.1:9999 -op addSrv -name apiserver -srv $PUBLIC_K8S_IP
+/usr/local/bin/lbctl -addr 192.168.50.1:9999 -op addTgt -name apiserver -srv 192.168.50.3 -sport 6443 -dport 6443
+```
+
+1. Prepare credentials for the Proxmox CCM provider 
+
+```bash
+
+```
+
+## Configure Kubeadm and create the cluster
+
+Login as `debian` to the new Kubernetes master node, and move to `root` using `sudo`.
+
+1. Add the public hostname to `/etc/hosts`
+
+   If this is intended to be a highly available Kubernetes cluster with multiple masters, then the control plane
+   endpoint needs to be pointed to by a DNS name. IPVS is not able to redirect traffic from a target host back
+   to the target host. In this case, `K8S_PUBLIC_APISERVER_DNSNAME` must resolve to `$PUBLIC_K8S_IP`.
+
+   ```bash
+   echo 127.0.0.3 $K8S_PUBLIC_APISERVER_DNSNAME >> /etc/hosts
+   ```
+
+1. Initialize Kubernetes
+
+   ```bash
+   kubeadm init --control-plane-endpoint ${K8S_PUBLIC_APISERVER_DNSNAME}:6443 --upload-certs
+   ```
+
+1. Install a CNI
+
+
+   ```bash
+
+   ```
+
+1. Install the Proxmox CCM provider
+
+
+
 
