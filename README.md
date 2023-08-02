@@ -40,6 +40,14 @@ using this cloud controller provider:
 
    Called `$STORAGE` in this README.
 
+1. Prepare an API token for the Proxmox Cloud Provider
+
+ > Note: The provided example command creates a very powerful API token, which is probably overkill. A future README will specify the exact privileges required.
+
+   ```bash
+   pveum user token add root@pam ccm -privsep=0
+   ```
+
 # Creating a Kubernetes Cluster
 
 ## Required Information
@@ -190,9 +198,8 @@ pct enter 1100
 
 1. Prepare credentials for the Proxmox CCM provider 
 
-```bash
-
-```
+Reuse the credentials created for `lbctl` by copying `/etc/lbmanager/lbctl.pem`, 
+`/etc/lbmanager/lbctl-key.pem`, and `/etc/lbmanager/ca.pem` to the master node being prepared.
 
 ## Configure Kubeadm and create the cluster
 
