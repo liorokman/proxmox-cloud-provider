@@ -67,25 +67,32 @@ ip netns exec LB sysctl net.ipv4.ip_forward=1
 ip netns exec LB iptables -t nat -A POSTROUTING -o external0 -j SNAT --to-source $ext_ip
 
 # 9. Setup a CA for lbmanager
+plain_ip=\$(echo \$ETH0_ADDR | cut -f1 -d/)
 mkdir -p /var/lib/lbmanagerca
 if [ ! -f /var/lib/lbmanagerca/ca.pem ]; then
-  plain_ip=\$(echo \$ETH0_ADDR | cut -f1 -d/)
   pushd /var/lib/lbmanagerca > /dev/null
+  # Certificate for lbmanager
   echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"HomeLab","CN":"Root LB CA"}]}' | \
         cfssl genkey -initca - | \
         cfssljson -bare ca
   echo "{\"hosts\": [\"\$plain_ip\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":"Homelab\",\"CN\":\"\$plain_ip\"}]}" | \
         cfssl gencert -ca ca.pem  -ca-key ca-key.pem  -  | \
         cfssljson -bare lbmanager
+  echo "{\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":\"Homelab\",\"CN\":\"lbctl\"}]}" | \
+        cfssl gencert -ca ca.pem  -ca-key ca-key.pem  -  | \
+        cfssljson -bare lbctl
   popd > /dev/null
 fi
 
 # 10. Install lbmanager 
 wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbmanager
+wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbctl
 chmod +x /usr/local/bin/lbmanager 
 mkdir -p /etc/lbmanager
 cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
 cp /var/lib/lbmanagerca/lbmanager-key.pem /etc/lbmanager/key.pem
+cp /var/lib/lbmanagerca/lbctl.pem /etc/lbmanager/lbctl.pem
+cp /var/lib/lbmanagerca/lbctl-key.pem /etc/lbmanager/lbctl-key.pem
 cp /var/lib/lbmanagerca/ca.pem /etc/lbmanager/ca.pem
 
 cat > /etc/lbmanager/lbmanager.yaml << END
@@ -107,6 +114,15 @@ loadbalancer:
     dynamicRange:
       startAt: $ext_start
       endAt: $ext_end
+END
+
+cat > /etc/lbmanager/lbctl.yaml << END
+---
+addr: \$plain_ip:9999
+auth:
+  clientKey: /etc/lbmanager/lbctl-key.pem
+  clientCert: /etc/lbmanager/lbctl.pem
+  caFile: /etc/lbmanager/ca.pem
 END
 
 cat > /etc/systemd/system/lbmanager.service << END

@@ -184,8 +184,8 @@ Enter the loadbalancer container and:
 
 ```bash
 pct enter 1100
-/usr/local/bin/lbctl -addr 192.168.50.1:9999 -op addSrv -name apiserver -srv $PUBLIC_K8S_IP
-/usr/local/bin/lbctl -addr 192.168.50.1:9999 -op addTgt -name apiserver -srv 192.168.50.3 -sport 6443 -dport 6443
+/usr/local/bin/lbctl -op addSrv -name apiserver -srv $PUBLIC_K8S_IP
+/usr/local/bin/lbctl -op addTgt -name apiserver -srv 192.168.50.3 -sport 6443 -dport 6443
 ```
 
 1. Prepare credentials for the Proxmox CCM provider 
@@ -208,17 +208,14 @@ Login as `debian` to the new Kubernetes master node, and move to `root` using `s
    echo 127.0.0.3 $K8S_PUBLIC_APISERVER_DNSNAME >> /etc/hosts
    ```
 
-1. Initialize Kubernetes
+1. Initialize Kubernetes and install a CNI
+
+   Add any parameters required for your CNI of choice.
 
    ```bash
    kubeadm init --control-plane-endpoint ${K8S_PUBLIC_APISERVER_DNSNAME}:6443 --upload-certs
-   ```
 
-1. Install a CNI
-
-
-   ```bash
-
+   # Install the required CNI
    ```
 
 1. Install the Proxmox CCM provider
