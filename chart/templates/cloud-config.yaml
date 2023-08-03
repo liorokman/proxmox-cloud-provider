@@ -6,7 +6,7 @@ metadata:
   labels:
     {{- include "chart.labels" . | nindent 4 }}
 data:
-  "config.yaml": |
+  "cloud-config.yaml": |
        security:
            cert: /var/run/secrets/ccm/tls.crt
            key: /var/run/secrets/ccm/tls.key

@@ -20,7 +20,6 @@ lbmanager:
 proxmox:
   apiToken:
   user:
-  caCert:
   apiURL: 
   insecure: false
   caCert:

@@ -9,7 +9,8 @@ COPY cmd ./cmd
 COPY internal ./internal 
 RUN go build -o proxmox-cloud-controller-manager .
 
-FROM gcr.io/distroless/static-debian11:latest
+#FROM gcr.io/distroless/base-debian12:latest
+FROM debian:stable
 
 COPY --from=builder /app/proxmox-cloud-controller-manager /
 

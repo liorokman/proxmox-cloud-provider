@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 
@@ -38,7 +39,11 @@ func newInstances(config ClusterConfig) (cloudprovider.InstancesV2, error) {
 	} else {
 		if config.CACert != "" {
 			capool := x509.NewCertPool()
-			if !capool.AppendCertsFromPEM([]byte(config.CACert)) {
+			data, err := os.ReadFile(config.CACert)
+			if err != nil {
+				return nil, err
+			}
+			if !capool.AppendCertsFromPEM(data) {
 				return nil, fmt.Errorf("Failed to load ca certificate")
 			}
 			tls.RootCAs = capool
@@ -48,7 +53,15 @@ func newInstances(config ClusterConfig) (cloudprovider.InstancesV2, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.SetAPIToken(config.Username, config.APIToken)
+	username, err := os.ReadFile(config.Username)
+	if err != nil {
+		return nil, err
+	}
+	apiToken, err := os.ReadFile(config.APIToken)
+	if err != nil {
+		return nil, err
+	}
+	c.SetAPIToken(string(username), string(apiToken))
 	if _, err := c.GetVersion(); err != nil {
 		return nil, fmt.Errorf("bad username password: %w", err)
 	}
