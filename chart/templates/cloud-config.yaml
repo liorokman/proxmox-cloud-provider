@@ -1,0 +1,22 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "chart.fullname" . }}-cloud-config
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+data:
+  "config.yaml": |
+       security:
+           cert: /var/run/secrets/ccm/tls.crt
+           key: /var/run/secrets/ccm/tls.key
+           ca: /var/run/secrets/ccm/ca.crt
+       managerHost: {{ .Values.lbmanager.hostname }}
+       managerPort: {{ default "9999" .Values.lbmanager.port }}
+       proxmoxConfig:
+         url:  {{ .Values.proxmox.apiURL }}
+         timeout: {{ default "5" .Values.proxmox.timeout }}
+         apiToken: /var/run/secrets/ccm/proxmoxToken
+         username: /var/run/secrets/ccm/proxmoxUser
+         insecureTLS: {{ default "false" .Values.proxmox.insecure }}
+         caCert: /var/run/secrets/ccm/proxmoxCA.crt

@@ -75,7 +75,7 @@ if [ ! -f /var/lib/lbmanagerca/ca.pem ]; then
   echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"HomeLab","CN":"Root LB CA"}]}' | \
         cfssl genkey -initca - | \
         cfssljson -bare ca
-  echo "{\"hosts\": [\"\$plain_ip\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":"Homelab\",\"CN\":\"\$plain_ip\"}]}" | \
+  echo "{\"hosts\": [\"\$plain_ip\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":\"Homelab\",\"CN\":\"\$plain_ip\"}]}" | \
         cfssl gencert -ca ca.pem  -ca-key ca-key.pem  -  | \
         cfssljson -bare lbmanager
   echo "{\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":\"Homelab\",\"CN\":\"lbctl\"}]}" | \
