@@ -2,11 +2,13 @@
 # Proxmox Cloud Controller Provider
 
 This projects provides all that is needed to create Kubernetes clusters on
-Proxmox where the Kubernetes clusters rely on the SDN feature in Proxmox. 
+Proxmox where the Kubernetes clusters hosts are in their own Proxmox isolated
+SDN VNet.
 
 The Proxmox SDN functionality allows creating an isolated network for the
 Kubernetes nodes, and this project provides the glue required to add a load balancer 
 and allow Kubernetes to configure it when `LoadBalancer` services are created.
+
 
 # Proxmox Setup
 
@@ -47,12 +49,16 @@ using this cloud controller provider:
    ```bash
    pveum user token add root@pam ccm -privsep=0
    ```
+ 
+   Set `PROXMOX_API_TOKEN` to the generated token, and set `PROXMOX_USERNAME`
+   to the correct username. In this example, the username would be
+   `root@pam!ccm`
 
 # Creating a Kubernetes Cluster
 
 ## Required Information
 
-1. As a convenience, choose a range of VM IDs to be used for the Kubernetes
+1. Choose a range of VM IDs to be used for the Kubernetes
    cluster. In this README, all Kubernetes related VMs and container will be in
    the range 1100-1200 .
 
@@ -138,7 +144,7 @@ will be fixed in future versions of this project.
 ## Prepare a VM Template for Kubernetes Nodes
 
 Follow the instructions in [this](https://github.com/liorokman/packer-Debian#use-in-proxmox)
-github repository to prepare a template that can be used for creating Kubernetes nodes.
+Github repository to prepare a template that can be used for creating Kubernetes nodes.
 
 This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
 
@@ -161,10 +167,10 @@ This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
    ```
 
    1. Set a valid IP address. The default gateway should be the loadbalancer's
-      ip in the `k8s` subnet.
+      ip in the `k8s` subnet: `$LB_EXT_IP`
 
    ```bash
-   qm set $K8S_NEW_ID -ipconfig0 ip=192.168.50.3/24,gw=192.168.50.1
+   qm set $K8S_NEW_ID -ipconfig0 ip=192.168.50.3/24,gw=$LB_EXT_IP
    ```
 1. Regenerate the cloud-init volume
 
@@ -203,7 +209,7 @@ Reuse the credentials created for `lbctl` by copying `/etc/lbmanager/lbctl.pem`,
 
 ## Configure Kubeadm and create the cluster
 
-Login as `debian` to the new Kubernetes master node, and move to `root` using `sudo`.
+Login as `debian` to the new Kubernetes master node, and move to `root` using `sudo -s`.
 
 1. Add the public hostname to `/etc/hosts`
 
@@ -222,11 +228,40 @@ Login as `debian` to the new Kubernetes master node, and move to `root` using `s
    ```bash
    kubeadm init --control-plane-endpoint ${K8S_PUBLIC_APISERVER_DNSNAME}:6443 --upload-certs
 
-   # Install the required CNI
+   # Install your choice of CNI
+
    ```
 
 1. Install the Proxmox CCM provider
 
+Prepare the following files: 
 
+* From the kubernetes master node: `/etc/kubernetes/admin.conf` 
+
+  The credentials to connect to Kubernetes, needed to allow Helm to connect to
+  Kubernetes.
+
+* From your Proxmox host: `/etc/pve/pve-root-ca.pem`
+
+  The certificate authority that signs the Proxmox API certificate, needed to
+  connect to the Proxmox API.
+
+* From your loadbalancer: `/etc/lbmanager/lbctl.pem`, `/etc/lbmanager/lbctl-key.pem`, and `/etc/lbmanager/ca.pem`
+
+  The mTLS credentials needed to connect to the load-balancer manager
+
+Install the Proxmox cloud provider with the following helm command:
+```bash
+helm install  --kubeconfig admin.conf proxmox-ccm  ./chart \
+        --namespace kube-system  \
+        --set lbmanager.hostname=$LB_MNG_IP \
+        --set-file lbmanager.tls.key=lbctl-key.pem   \
+        --set-file lbmanager.tls.cert=lbctl.pem \
+        --set-file lbmanager.tls.caCert=ca.pem \
+        --set proxmox.apiToken=$PROXMOX_API_TOKEN \
+        --set proxmox.user=$PROXMOX_API_USERNAME  \
+        --set proxmox.apiURL=https://$PROXMOX_HOSTNAME:8006/api2/json \
+        --set-file proxmox.caCert=pve-root-ca.pem
+```
 
 
