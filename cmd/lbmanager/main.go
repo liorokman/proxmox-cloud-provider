@@ -100,6 +100,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed starting the loadbalancer manager: %v", err)
 	}
+	defer lbServer.Close()
+	if err := lbServer.Restore(); err != nil {
+		log.Fatalf("failed restoring the loadbalancer configuration: %v", err)
+	}
 	opts := []grpc.ServerOption{
 		grpc.Creds(creds),
 	}

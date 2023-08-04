@@ -50,7 +50,7 @@ using this cloud controller provider:
    pveum user token add root@pam ccm -privsep=0
    ```
  
-   Set `PROXMOX_API_TOKEN` to the generated token, and set `PROXMOX_USERNAME`
+   Set `PROXMOX_API_TOKEN` to the generated token, and set `PROXMOX_API_USERNAME`
    to the correct username. In this example, the username would be
    `root@pam!ccm`
 

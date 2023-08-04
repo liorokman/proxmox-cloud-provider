@@ -50,6 +50,7 @@ type loadBalancerServer struct {
 type Intf interface {
 	LoadBalancerServer
 	Close()
+	Restore() error
 }
 
 func (l *loadBalancerServer) Close() {
@@ -135,6 +136,36 @@ func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol)
 	}
 }
 
+// Restore applies all the settings stored in the database to the current state
+func (l *loadBalancerServer) Restore() error {
+	iterOptions := rosedb.DefaultIteratorOptions
+	iter := l.db.NewIterator(iterOptions)
+	defer iter.Close()
+	for ; iter.Valid(); iter.Next() {
+		val, err := iter.Value()
+		if err != nil {
+			return err
+		}
+		var currLB LoadBalancerInformation
+		if err := json.Unmarshal(val, &currLB); err != nil {
+			return err
+		}
+		if err := l.addAddrAlias(currLB.IpAddr); err != nil {
+			return err
+		}
+		for port, targets := range currLB.Targets {
+			if targets != nil {
+				for _, target := range targets.Target {
+					if _, err := l.mapTarget(&currLB, port, target); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // Get all information about all defined Load Balancers
 func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalancer_GetLoadBalancersServer) error {
 	iterOptions := rosedb.DefaultIteratorOptions
@@ -187,15 +218,27 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 		IpAddr:  *clb.IpAddr,
 		Targets: map[int32]*TargetList{},
 	}
-	log.Printf("slb is %+v", lbInfo)
 
-	externalIP := net.ParseIP(lbInfo.IpAddr)
-	if !l.ipam.Contains(externalIP) {
-		return nil, fmt.Errorf("Requested IP %s is not contained in the configured CIDR (%s)", *clb.IpAddr, l.cidr)
+	// Create a new alias on the interface that matches the required IP
+	// There could already be such an interface, since there might be another LB with the same IP and different port
+	if err := l.addAddrAlias(lbInfo.IpAddr); err != nil {
+		log.Printf("error adding an alias for the loadbalancer %s: %s", lbInfo.Name, err.Error())
+		return nil, err
 	}
 
-	// 1. Create a new alias on the interface that matches the required IP
-	//    There could already be such an interface, since there might be another LB with the same IP and different port
+	lbInfoData, err := json.Marshal(lbInfo)
+	if err != nil {
+		return nil, err
+	}
+	err = l.db.Put([]byte(clb.Name), lbInfoData)
+	return lbInfo, err
+}
+
+func (l *loadBalancerServer) addAddrAlias(addrString string) error {
+	externalIP := net.ParseIP(addrString)
+	if !l.ipam.Contains(externalIP) {
+		return fmt.Errorf("Requested IP %s is not contained in the configured CIDR (%s)", addrString, l.cidr)
+	}
 	requiredAddr := &netlink.Addr{
 		IPNet: &net.IPNet{
 			IP:   externalIP,
@@ -213,16 +256,10 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 	if !addrFound {
 		err = l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
-
-	lbInfoData, err := json.Marshal(lbInfo)
-	if err != nil {
-		return nil, err
-	}
-	err = l.db.Put([]byte(clb.Name), lbInfoData)
-	return lbInfo, err
+	return nil
 }
 
 func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerName) (*Error, error) {
@@ -303,31 +340,11 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 		}
 	}
 
-	targetIP := net.ParseIP(atr.Target.DstIP)
-	var fam uint16 = syscall.AF_INET
-	if targetIP.To4() == nil {
-		fam = syscall.AF_INET6
+	ret, err := l.mapTarget(lbInfo, atr.SrcPort, atr.Target)
+	if err != nil || ret != nil {
+		return ret, err
 	}
-	srv := toIPVSService(lbInfo, atr.SrcPort, atr.Target.Protocol)
-	if !l.ipvsHandle.IsServicePresent(srv) {
-		if err = l.ipvsHandle.NewService(srv); err != nil {
-			return nil, err
-		}
-	}
-	newDestination := &ipvs.Destination{
-		Address:         targetIP,
-		Port:            uint16(atr.Target.DstPort),
-		ConnectionFlags: ipvs.ConnFwdMasq,
-		AddressFamily:   fam,
-		Weight:          1,
-	}
-	if err := l.ipvsHandle.NewDestination(srv, newDestination); err != nil {
-		log.Printf("error adding a new destination %+v to service %+v: %+v", atr.Target, lbInfo, err)
-		return &Error{
-			Message: err.Error(),
-			Code:    ErrAddDestinationFailed,
-		}, nil
-	}
+
 	targetList.Target = append(targetList.Target, atr.Target)
 	lbInfo.Targets[atr.SrcPort] = targetList
 
@@ -339,6 +356,37 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 		return nil, err
 	}
 	return &Error{}, err
+}
+
+// mapTarget maps a given target to the provided loadbalancer on the provided
+// srcPort
+func (l *loadBalancerServer) mapTarget(lbInfo *LoadBalancerInformation, srcPort int32, target *Target) (*Error, error) {
+	targetIP := net.ParseIP(target.DstIP)
+	var fam uint16 = syscall.AF_INET
+	if targetIP.To4() == nil {
+		fam = syscall.AF_INET6
+	}
+	srv := toIPVSService(lbInfo, srcPort, target.Protocol)
+	if !l.ipvsHandle.IsServicePresent(srv) {
+		if err := l.ipvsHandle.NewService(srv); err != nil {
+			return nil, err
+		}
+	}
+	newDestination := &ipvs.Destination{
+		Address:         targetIP,
+		Port:            uint16(target.DstPort),
+		ConnectionFlags: ipvs.ConnFwdMasq,
+		AddressFamily:   fam,
+		Weight:          1,
+	}
+	if err := l.ipvsHandle.NewDestination(srv, newDestination); err != nil {
+		log.Printf("error adding a new destination %+v to service %+v: %+v", target, lbInfo, err)
+		return &Error{
+			Message: err.Error(),
+			Code:    ErrAddDestinationFailed,
+		}, nil
+	}
+	return nil, nil
 }
 
 func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetRequest) (*Error, error) {
