@@ -87,7 +87,7 @@ fi
 # 10. Install lbmanager 
 wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbmanager
 wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbctl
-chmod +x /usr/local/bin/lbmanager 
+chmod +x /usr/local/bin/lbmanager  /usr/local/bin/lbctl
 mkdir -p /etc/lbmanager
 cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
 cp /var/lib/lbmanagerca/lbmanager-key.pem /etc/lbmanager/key.pem
