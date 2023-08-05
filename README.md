@@ -201,7 +201,8 @@ Enter the loadbalancer container and:
 ```bash
 pct enter 1100
 /usr/local/bin/lbctl -op addSrv -name apiserver -srv $PUBLIC_K8S_IP
-/usr/local/bin/lbctl -op addTgt -name apiserver -srv 192.168.50.3 -sport 6443 -dport 6443
+/usr/local/bin/lbctl -op addTgt -name apiserver -srv $NODE_INTERNAL_IP -sport 6443 -dport 6443
+ip netns exec LB iptables -t nat -I POSTROUTING 1 -m ipvs --destination $K8S_NETWORK_WITH_CIDR --vaddr $PUBLIC_K8S_IP -j MASQUERADE
 ```
 
 1. Prepare credentials for the Proxmox CCM provider 
@@ -212,16 +213,6 @@ Reuse the credentials created for `lbctl` by copying `/etc/lbmanager/lbctl.pem`,
 ## Configure Kubeadm and create the cluster
 
 Login as `debian` to the new Kubernetes master node, and move to `root` using `sudo -s`.
-
-1. Add the public hostname to `/etc/hosts`
-
-   If this is intended to be a highly available Kubernetes cluster with multiple masters, then the control plane
-   endpoint needs to be pointed to by a DNS name. IPVS is not able to redirect traffic from a target host back
-   to the target host. In this case, `K8S_PUBLIC_APISERVER_DNSNAME` must resolve to `$PUBLIC_K8S_IP`.
-
-   ```bash
-   echo 127.0.0.3 $K8S_PUBLIC_APISERVER_DNSNAME >> /etc/hosts
-   ```
 
 1. Initialize Kubernetes and install a CNI
 
