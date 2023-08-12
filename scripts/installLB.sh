@@ -35,6 +35,7 @@ ip netns exec LB ip link set lo up
 
 # 3. Move eth1 into it, copy the address it has into the new namespace
 ETH1_ADDR=\$(ip -j addr show dev eth1 | jq -r '.[0].addr_info[] | select( .family == "inet") | (.local) + "/" + (.prefixlen|tostring)')
+
 ip link set eth1 netns LB
 ip netns exec LB ip addr add \$ETH1_ADDR dev eth1
 ip netns exec LB ip link set eth1 up
@@ -64,6 +65,7 @@ ip netns exec LB ip route add default via \$ETH0_GW
 ip netns exec LB sysctl net.ipv4.ip_forward=1
 
 # 8. Setup SNAT so this container can serve as an internet gateway
+ip netns exec LB iptables -t nat -A POSTROUTING -m ipvs --destination \$ETH1_ADDR --vaddr $ext_ip  -j MASQUERADE
 ip netns exec LB iptables -t nat -A POSTROUTING -o external0 -j SNAT --to-source $ext_ip
 
 # 9. Setup a CA for lbmanager
@@ -87,7 +89,7 @@ fi
 # 10. Install lbmanager 
 wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbmanager
 wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbctl
-chmod +x /usr/local/bin/lbmanager  /usr/local/bin/lbctl
+chmod +x /usr/local/bin/lbmanager /usr/local/bin/lbctl
 mkdir -p /etc/lbmanager
 cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
 cp /var/lib/lbmanagerca/lbmanager-key.pem /etc/lbmanager/key.pem

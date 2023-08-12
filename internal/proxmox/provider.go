@@ -52,6 +52,7 @@ type ClusterConfig struct {
 	Username    string `yaml:"username"`
 	InsecureTLS bool   `yaml:"insecureTLS"`
 	CACert      string `yaml:"caCert"`
+	Debug       bool   `yaml:"debug"`
 }
 
 // New returns a new instance of the proxmox cloud provider

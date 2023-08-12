@@ -61,9 +61,11 @@ func newInstances(config ClusterConfig) (cloudprovider.InstancesV2, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.SetAPIToken(string(username), string(apiToken))
+	proxmox.Debug = &config.Debug
+	c.SetAPIToken(strings.Trim(string(username), "\n\r \t"),
+		strings.Trim(string(apiToken), "\n\r \t"))
 	if _, err := c.GetVersion(); err != nil {
-		return nil, fmt.Errorf("bad username password: %w", err)
+		return nil, fmt.Errorf("bad username password: (%+v) %w", c, err)
 	}
 	return &Instances{
 		client: c,
