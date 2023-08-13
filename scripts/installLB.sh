@@ -63,6 +63,7 @@ ip netns exec LB ip route add default via \$ETH0_GW
 
 # 7. Setup ip forwarding in the LB namespace
 ip netns exec LB sysctl net.ipv4.ip_forward=1
+ip netns exec LB sysctl net.ipv4.vs.conntrack=1
 
 # 8. Setup SNAT so this container can serve as an internet gateway
 ip netns exec LB iptables -t nat -A POSTROUTING -m ipvs --destination \$ETH1_ADDR --vaddr $ext_ip  -j MASQUERADE
