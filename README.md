@@ -146,7 +146,7 @@ will be fixed in future versions of this project.
 Follow the instructions in [this](https://github.com/liorokman/packer-Debian#use-in-proxmox)
 Github repository to prepare a template that can be used for creating Kubernetes nodes.
 
-A pre-built image is available in the [releases](https://github.com/liorokman/proxmox-cloud-provider/releases/tag/v0.0.1) section of this project with `kubeadm`, `kubelet`, and `kubectl` versions 1.27.4 .
+A pre-built image is available in the [releases](https://github.com/liorokman/proxmox-cloud-provider/releases/tag/v0.0.2) section of this project with `kubeadm`, `kubelet`, and `kubectl` versions 1.27.4 .
 
 This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
 

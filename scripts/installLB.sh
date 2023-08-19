@@ -88,8 +88,8 @@ if [ ! -f /var/lib/lbmanagerca/ca.pem ]; then
 fi
 
 # 10. Install lbmanager 
-wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbmanager
-wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.1/lbctl
+wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.2/lbmanager
+wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.2/lbctl
 chmod +x /usr/local/bin/lbmanager /usr/local/bin/lbctl
 mkdir -p /etc/lbmanager
 cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
