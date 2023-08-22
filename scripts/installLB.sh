@@ -18,7 +18,7 @@ writeFile() {
 	ext_end=$(echo $ct_notes | jq -r .end)
 	ext_start=$(echo $ct_notes | jq -r .start)
 
-	pct exec $VMID -- tee $filename << EOF
+	pct exec $VMID tee $filename << EOF
 #!/bin/bash
 
 # Install the necessary tools
@@ -107,7 +107,7 @@ grpc:
     cert: /etc/lbmanager/cert.pem
     key: /etc/lbmanager/key.pem
     ca: /etc/lbmanager/ca.pem
-dbDir: /var/run/lbmanager
+dbDir: /var/lib/lbmanager
 loadbalancer:
   namespace: LB
   externalInterface: external0
@@ -147,15 +147,15 @@ systemctl start lbmanager
 
 
 EOF
-	pct exec $VMID chmod +x /tmp/install.sh
+	pct exec $VMID chmod +x $filename
 }
 
 case "$PHASE"  in
    pre-start)
    ;;
    post-start)
-	   writeFile /tmp/install.sh
-	   pct exec $VMID -- /tmp/install.sh
+	   writeFile /install.sh
+	   pct exec $VMID /install.sh
    ;;
    pre-stop)
    ;;

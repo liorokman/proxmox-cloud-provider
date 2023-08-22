@@ -19,6 +19,14 @@ using this cloud controller provider:
    
    Full documentation is available [here](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html).
 
+1. Install the `jq` utility on Proxmox
+
+   This utility is used by the hookscript for creating the loadbalancer.
+
+   ```bash
+      apt install jq
+   ```
+
 1. Configure an SDN zone for Kubernetes clusters
 
    Create a VXLAN or VLAN zone that will contain VNets for your Kubernetes clusters. 
