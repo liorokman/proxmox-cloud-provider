@@ -114,7 +114,7 @@ will be fixed in future versions of this project.
       DESCRIPTION="{\"ip\":\"$LB_EXT_IP\",\"mask\":24,\"start\":\"$LB_EXT_START\",\"end\":\"$LB_EXT_END\"}"
       pct create 1100  local:vztmpl/debian-12-standard_12.0-1_amd64.tar.zst  \
           -unprivileged 0 \
-          -cores 2 -swap 0 -memory 256 -hostname k8slb1  \
+          -cores 2 -swap 0 -memory 512 -hostname k8slb1  \
           -net0 name=eth0,bridge=vmbr0,firewall=1,ip=$LB_EXT_IP/$EXT_CIDR,gw=$EXT_GW,type=veth \
           -net1 name=eth1,bridge=k8s,firewall=1,ip=192.168.50.1/24,type=veth \
           -ostype debian  -features nesting=1 \
