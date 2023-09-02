@@ -210,7 +210,6 @@ Enter the loadbalancer container and:
 pct enter 1100
 /usr/local/bin/lbctl -op addSrv -name apiserver -srv $PUBLIC_K8S_IP
 /usr/local/bin/lbctl -op addTgt -name apiserver -srv $NODE_INTERNAL_IP -sport 6443 -dport 6443
-ip netns exec LB iptables -t nat -I POSTROUTING 1 -m ipvs --destination $K8S_NETWORK_WITH_CIDR --vaddr $PUBLIC_K8S_IP -j MASQUERADE
 ```
 
 1. Prepare credentials for the Proxmox CCM provider 
