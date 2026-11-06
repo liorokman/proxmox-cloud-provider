@@ -80,7 +80,7 @@ var errVMNotFound = errors.New("virtual machine not found")
 // Use the node.name or node.spec.providerID field to find the node in the cloud provider.
 func (i *Instances) InstanceExists(ctx context.Context, node *v1.Node) (bool, error) {
 	log.Printf("InstanceExists called for node %s ", node.Name)
-	_, err := i.findVM(ctx, node)
+	_, _, err := i.findVM(ctx, node)
 	if errors.Is(err, errVMNotFound) {
 		return false, nil
 	}
@@ -93,7 +93,7 @@ func (i *Instances) InstanceExists(ctx context.Context, node *v1.Node) (bool, er
 // Use the node.name or node.spec.providerID field to find the node in the cloud provider.
 func (i *Instances) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
 	log.Printf("InstanceShutdown called for node %s ", node.Name)
-	vm, err := i.findVM(ctx, node)
+	vm, _, err := i.findVM(ctx, node)
 	if err != nil {
 		return false, err
 	}
@@ -110,20 +110,101 @@ func (i *Instances) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, 
 // properties of the node like its name, labels and annotations.
 func (i *Instances) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
 	log.Printf("InstanceMetadata called for node %s ", node.Name)
-	vm, err := i.findVM(ctx, node)
+	vm, clusterName, err := i.findVM(ctx, node)
 	if err != nil {
 		return nil, err
 	}
 
+	// The addresses the guest agent reports on the VM's own network interfaces
+	// work for static and DHCP configurations. Without an agent, use the static
+	// cloud-init settings.
+	var agentIfaces []*proxmox.AgentNetworkIface
+	if vm.Status == "running" {
+		if agentIfaces, err = vm.AgentGetNetworkIFaces(ctx); err != nil {
+			log.Printf("guest agent of %s is not available, using the cloud-init settings: %v", vm.Name, err)
+		}
+	}
+
+	if clusterName == "" {
+		clusterName = defaultRegion
+	}
 	retval := &cloudprovider.InstanceMetadata{
 		ProviderID:    getProviderID(vm),
-		InstanceType:  "qemu",
-		NodeAddresses: getAddresses(vm.VirtualMachineConfig),
+		InstanceType:  instanceType(vm.CPUs, vm.MaxMem),
+		NodeAddresses: nodeAddresses(vm.VirtualMachineConfig, agentIfaces),
 		Zone:          vm.Node,
+		Region:        clusterName,
 	}
 
 	log.Printf("Metadata returns %+v", retval)
 	return retval, nil
+}
+
+// defaultRegion is the region of nodes whose Proxmox host is not in a cluster
+const defaultRegion = "proxmox"
+
+// instanceType describes the size of the VM, for example "4c-8g".
+func instanceType(cpus int, maxMem uint64) string {
+	if cpus <= 0 || maxMem == 0 {
+		return "qemu"
+	}
+	if maxMem%(1<<30) == 0 {
+		return fmt.Sprintf("%dc-%dg", cpus, maxMem>>30)
+	}
+	return fmt.Sprintf("%dc-%dm", cpus, maxMem>>20)
+}
+
+// nodeAddresses prefers the addresses reported by the guest agent, and falls back
+// to the static cloud-init settings. The hostname is always included.
+func nodeAddresses(config *proxmox.VirtualMachineConfig, ifaces []*proxmox.AgentNetworkIface) []v1.NodeAddress {
+	static := getAddresses(config)
+	fromAgent := agentAddresses(config, ifaces)
+	if len(fromAgent) == 0 {
+		return static
+	}
+	for _, a := range static {
+		if a.Type == v1.NodeHostName {
+			fromAgent = append(fromAgent, a)
+		}
+	}
+	return fromAgent
+}
+
+// agentAddresses returns the IPv4 addresses of the interfaces that carry one of the
+// VM's own MAC addresses. Interfaces created inside the guest (pod networks, bridges,
+// docker, ...) have other MACs and are ignored, as are loopback and link-local addresses.
+func agentAddresses(config *proxmox.VirtualMachineConfig, ifaces []*proxmox.AgentNetworkIface) []v1.NodeAddress {
+	if config == nil {
+		return nil
+	}
+	macs := map[string]bool{}
+	for _, nic := range config.Nets {
+		for _, part := range strings.Split(nic, ",") {
+			// model=MAC, for example virtio=BC:24:11:AA:BB:CC
+			if _, v, found := strings.Cut(part, "="); found {
+				if hw, err := net.ParseMAC(v); err == nil {
+					macs[hw.String()] = true
+				}
+			}
+		}
+	}
+	retval := []v1.NodeAddress{}
+	seen := map[string]bool{}
+	for _, iface := range ifaces {
+		hw, err := net.ParseMAC(iface.HardwareAddress)
+		if err != nil || !macs[hw.String()] {
+			continue
+		}
+		for _, a := range iface.IPAddresses {
+			ip := net.ParseIP(a.IPAddress)
+			if ip == nil || ip.To4() == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || seen[ip.String()] {
+				continue
+			}
+			seen[ip.String()] = true
+			retval = append(retval, v1.NodeAddress{Type: v1.NodeInternalIP, Address: ip.String()})
+		}
+	}
+	return retval
 }
 
 func getAddresses(config *proxmox.VirtualMachineConfig) []v1.NodeAddress {
@@ -191,18 +272,19 @@ func parseProviderID(providerID string) (int, bool) {
 }
 
 // findVM locates the virtual machine backing a Kubernetes node, first by the providerID
-// and, failing that, by the node name. The returned VM includes its current status and configuration.
-func (i *Instances) findVM(ctx context.Context, node *v1.Node) (*proxmox.VirtualMachine, error) {
+// and, failing that, by the node name. The returned VM includes its current status and configuration,
+// and the name of the Proxmox cluster is returned as well.
+func (i *Instances) findVM(ctx context.Context, node *v1.Node) (*proxmox.VirtualMachine, string, error) {
 	if i.client == nil {
-		return nil, fmt.Errorf("not connected to any proxmox cluster")
+		return nil, "", fmt.Errorf("not connected to any proxmox cluster")
 	}
 	cluster, err := i.client.Cluster(ctx)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	resources, err := cluster.Resources(ctx, "vm")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	vmid, byID := parseProviderID(node.Spec.ProviderID)
@@ -217,12 +299,13 @@ func (i *Instances) findVM(ctx context.Context, node *v1.Node) (*proxmox.Virtual
 		}
 	}
 	if match == nil {
-		return nil, fmt.Errorf("%w: node %s (providerID %q)", errVMNotFound, node.Name, node.Spec.ProviderID)
+		return nil, "", fmt.Errorf("%w: node %s (providerID %q)", errVMNotFound, node.Name, node.Spec.ProviderID)
 	}
 
 	pveNode, err := i.client.Node(ctx, match.Node)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return pveNode.VirtualMachine(ctx, int(match.VMID))
+	vm, err := pveNode.VirtualMachine(ctx, int(match.VMID))
+	return vm, cluster.Name, err
 }

@@ -186,3 +186,87 @@ func TestRestoreSurvivesBadRecord(t *testing.T) {
 }
 
 func netlinkParse(s string) (*netlink.Addr, error) { return netlink.ParseAddr(s) }
+
+func tl(ip string, port int32) *Target {
+	return &Target{Protocol: Protocol_TCP, DstIP: ip, DstPort: port}
+}
+
+func TestApplyConverges(t *testing.T) {
+	s := newTestServer(t)
+	l := s.(*loadBalancerServer)
+	ctx := context.Background()
+	req := &ApplyRequest{Name: "app", Targets: map[int32]*TargetList{
+		80:   {Target: []*Target{tl("192.168.100.5", 30080), tl("192.168.100.6", 30080)}},
+		8080: {Target: []*Target{tl("192.168.100.5", 30081)}},
+	}}
+	res, err := s.Apply(ctx, req)
+	if err != nil || len(res.PortErrors) != 0 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	defer s.Delete(ctx, &LoadBalancerName{Name: "app"})
+	ip := res.Info.IpAddr
+	if ip == "" {
+		t.Fatal("no address allocated")
+	}
+	// Repeating changes nothing, and keeps the address
+	res, err = s.Apply(ctx, req)
+	if err != nil || res.Info.IpAddr != ip || len(res.PortErrors) != 0 {
+		t.Fatalf("second apply: %v %+v", err, res)
+	}
+	if w := destWeights(t, l, "app", 80); len(w) != 2 {
+		t.Errorf("unexpected destinations %v", w)
+	}
+	// Remove a node, drop a port, add another
+	req.Targets[80] = &TargetList{Target: []*Target{tl("192.168.100.6", 30080)}}
+	delete(req.Targets, 8080)
+	req.Targets[443] = &TargetList{Target: []*Target{tl("192.168.100.6", 30443)}}
+	res, err = s.Apply(ctx, req)
+	if err != nil || len(res.PortErrors) != 0 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if w := destWeights(t, l, "app", 80); len(w) != 1 || w["192.168.100.6:30080"] != 1 {
+		t.Errorf("port 80: %v", w)
+	}
+	if len(res.Info.Targets) != 2 || res.Info.Targets[8080] != nil {
+		t.Errorf("stored state: %+v", res.Info.Targets)
+	}
+	if svcs, _ := l.ipvsHandle.GetServices(); len(svcs) != 2 {
+		t.Errorf("expected 2 ipvs services, got %d", len(svcs))
+	}
+	// The address can't be changed
+	if _, err := s.Apply(ctx, &ApplyRequest{Name: "app", IpAddr: asPtr("192.168.87.236")}); err == nil {
+		t.Error("changing the address must fail")
+	}
+	// Applying nothing empties it
+	res, err = s.Apply(ctx, &ApplyRequest{Name: "app"})
+	if err != nil || len(res.Info.Targets) != 0 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if svcs, _ := l.ipvsHandle.GetServices(); len(svcs) != 0 {
+		t.Errorf("expected no ipvs services, got %d", len(svcs))
+	}
+}
+
+func TestApplyPortConflictIsPerPort(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	ip := asPtr("192.168.87.237")
+	if _, err := s.Apply(ctx, &ApplyRequest{Name: "one", IpAddr: ip, Targets: map[int32]*TargetList{80: {Target: []*Target{tl("192.168.100.5", 1)}}}}); err != nil {
+		t.Fatal(err)
+	}
+	defer s.Delete(ctx, &LoadBalancerName{Name: "one"})
+	res, err := s.Apply(ctx, &ApplyRequest{Name: "two", IpAddr: ip, Targets: map[int32]*TargetList{
+		80: {Target: []*Target{tl("192.168.100.5", 2)}},
+		81: {Target: []*Target{tl("192.168.100.5", 3)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Delete(ctx, &LoadBalancerName{Name: "two"})
+	if res.PortErrors[80] == "" || res.PortErrors[81] != "" {
+		t.Errorf("only port 80 should fail: %v", res.PortErrors)
+	}
+	if res.Info.Targets[80] != nil || res.Info.Targets[81] == nil {
+		t.Errorf("unexpected state %+v", res.Info.Targets)
+	}
+}

@@ -91,6 +91,14 @@ privileged tests on the devstack host, and the devstack cluster.
 
 ### P1: much more useful for little work
 
+**All of P1 is done** on the main branch (not released yet). The Helm chart's new cluster
+role has a new name, so `helm upgrade` replaces the old `cluster-admin` binding.
+The cloud provider and `lbmanager` must be upgraded together (the new
+`Apply` call), and the Proxmox role needs `VM.GuestAgent.Audit`. The hookscript
+uses a third NIC when the container has one, disables IPv6 on the LAN interface
+(problem 13), and sends a gratuitous ARP when addresses appear. Node labels are
+only set when a node registers, so existing nodes keep their old ones.
+
 4. Node addresses from the QEMU guest agent, falling back to static cloud-init
    settings. Makes DHCP and IPAM based setups work. **S**
 5. Declarative `Apply` API. **M**

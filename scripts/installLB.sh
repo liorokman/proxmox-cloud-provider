@@ -25,10 +25,12 @@ writeFile() {
 	pct exec $VMID tee $filename << EOF
 #!/bin/bash
 
-# Install the necessary tools
-apt-get -y update
-apt-get -y upgrade
-apt-get -y install ipvsadm iptables jq bridge-utils wget golang-cfssl
+# Install the necessary tools, unless they are all there already
+PACKAGES="ipvsadm iptables jq wget golang-cfssl"
+if ! dpkg -s \$PACKAGES > /dev/null 2>&1; then
+  apt-get -y update
+  apt-get -y install \$PACKAGES
+fi
 
 # Create the required network environment:
 # 1. Create a new namespace for the LB
@@ -44,25 +46,39 @@ ip link set eth1 netns LB
 ip netns exec LB ip addr add \$ETH1_ADDR dev eth1
 ip netns exec LB ip link set eth1 up
 
-# 4. Create a new network bridge and a pair of veth devices
-brctl addbr br0
-ip link add veth1 type veth peer name external0 netns LB
-ip link set veth1 up
-brctl addif br0 veth1
-ip link set br0 up
-
-# 5. Move the ip address from eth0 to br0 and add eth0 to br0
+# 4. The LAN side. With a third network interface (eth2) it moves into the
+# namespace as it is, and eth0 stays outside as the management interface.
+# Otherwise, fall back to bridging eth0 to a veth pair whose other end is in
+# the namespace.
 ETH0_ADDR=\$(ip -j addr show dev eth0 | jq -r '.[0].addr_info[] | select( .family == "inet") | (.local) + "/" + (.prefixlen|tostring)')
 ETH0_GW=\$(ip -j route | jq -r ' .[] | select( .dst == "default" ) | .gateway ' )
 
-ip addr del \$ETH0_ADDR dev eth0
-brctl addif br0 eth0
-ip addr add \$ETH0_ADDR dev br0
-ip route add default via \$ETH0_GW
+if ip link show dev eth2 > /dev/null 2>&1; then
+  EXT_IF=eth2
+  ip link set eth2 netns LB
+else
+  apt-get -y install bridge-utils
+  EXT_IF=external0
+  brctl addbr br0
+  ip link add veth1 type veth peer name external0 netns LB
+  ip link set veth1 up
+  brctl addif br0 veth1
+  ip link set br0 up
 
-# 6. Setup the bridged device in the LB network namespace
-ip netns exec LB ip link set external0 up
-ip netns exec LB ip addr add $ext_ip/$ext_mask dev external0
+  # Move the ip address from eth0 to br0 and add eth0 to br0
+  ip addr del \$ETH0_ADDR dev eth0
+  brctl addif br0 eth0
+  ip addr add \$ETH0_ADDR dev br0
+  ip route add default via \$ETH0_GW
+fi
+
+# 5. Setup the LAN device in the LB network namespace. IPv6 is not supported,
+# and the LAN's router advertisements must not give it an address.
+ip netns exec LB sysctl -q net.ipv6.conf.\$EXT_IF.disable_ipv6=1
+# Announce new addresses with a gratuitous ARP, so the LAN notices a changed MAC address
+ip netns exec LB sysctl -q net.ipv4.conf.\$EXT_IF.arp_notify=1
+ip netns exec LB ip link set \$EXT_IF up
+ip netns exec LB ip addr add $ext_ip/$ext_mask dev \$EXT_IF
 ip netns exec LB ip route add default via \$ETH0_GW
 
 # 7. Setup ip forwarding in the LB namespace
@@ -74,7 +90,7 @@ ip netns exec LB sysctl net.ipv4.vs.conntrack=1
 # rewritten. Otherwise the target answers the client directly, bypassing this container.
 ETH1_NET=\$(ip netns exec LB ip -j route show dev eth1 scope link | jq -r '.[0].dst')
 ip netns exec LB iptables -t nat -A POSTROUTING -s \$ETH1_NET -d \$ETH1_NET -m ipvs --ipvs -j MASQUERADE
-ip netns exec LB iptables -t nat -A POSTROUTING -o external0 -j SNAT --to-source $ext_ip
+ip netns exec LB iptables -t nat -A POSTROUTING -o \$EXT_IF -j SNAT --to-source $ext_ip
 
 # 9. Setup a CA for lbmanager
 plain_ip=\$(echo \$ETH0_ADDR | cut -f1 -d/)
@@ -97,8 +113,18 @@ fi
 # 10. Install lbmanager 
 # The binaries are pushed from the snippets directory when they are present there,
 # otherwise they are downloaded from the release.
+# Downloads are verified against the SHA256SUMS of the release.
+RELEASE_URL=https://github.com/liorokman/proxmox-cloud-provider/releases/download/$LBMANAGER_VERSION
 for bin in lbmanager lbctl; do
-  [ -x /usr/local/bin/\$bin ] || wget -q -O /usr/local/bin/\$bin https://github.com/liorokman/proxmox-cloud-provider/releases/download/$LBMANAGER_VERSION/\$bin
+  if [ ! -x /usr/local/bin/\$bin ]; then
+    SUMS=\$(mktemp)
+    wget -q -O \$SUMS \$RELEASE_URL/SHA256SUMS && \
+      wget -q -O /usr/local/bin/\$bin.download \$RELEASE_URL/\$bin && \
+      awk -v b="\$bin" '\$2 == b { print \$1 "  /usr/local/bin/" b ".download" }' \$SUMS | sha256sum -c --quiet - || \
+      { echo "ERROR: could not download and verify \$bin $LBMANAGER_VERSION" >&2; rm -f /usr/local/bin/\$bin.download \$SUMS; exit 1; }
+    mv /usr/local/bin/\$bin.download /usr/local/bin/\$bin
+    rm -f \$SUMS
+  fi
 done
 chmod +x /usr/local/bin/lbmanager /usr/local/bin/lbctl
 mkdir -p /etc/lbmanager
@@ -120,13 +146,15 @@ grpc:
 dbDir: /var/lib/lbmanager
 loadbalancer:
   namespace: LB
-  externalInterface: external0
+  externalInterface: \$EXT_IF
   internalInterface: eth1
   ipam:
     cidr: $ext_ip/$ext_mask
     dynamicRange:
       startAt: $ext_start
       endAt: $ext_end
+metrics:
+  listen: \$plain_ip:9100
 END
 
 cat > /etc/lbmanager/lbctl.yaml << END

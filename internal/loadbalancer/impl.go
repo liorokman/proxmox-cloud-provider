@@ -56,7 +56,8 @@ type loadBalancerServer struct {
 	// Health checking; the tracker is protected by mu
 	healthCfg healthConfig
 	health    *healthTracker
-	probe     func(addr string) bool
+	probe     func(t *Target) bool
+	kick      chan struct{}
 }
 
 type Intf interface {
@@ -66,6 +67,9 @@ type Intf interface {
 	// StartHealthChecks probes the targets until ctx is done. It returns
 	// immediately if health checking is disabled.
 	StartHealthChecks(ctx context.Context)
+	// ServeMetrics serves Prometheus metrics on addr (host:port) until ctx is
+	// done. An empty addr does nothing.
+	ServeMetrics(ctx context.Context, addr string) error
 }
 
 func (l *loadBalancerServer) Close() {
@@ -143,6 +147,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		ipvsHandle:   ipvsHandle,
 		ipam:         ipManagement,
 	}
+	lbServer.kick = make(chan struct{}, 1)
 	lbServer.healthCfg = readHealthConfig(config)
 	lbServer.health = newHealthTracker(lbServer.healthCfg.fall, lbServer.healthCfg.rise)
 	// The addresses in use are exactly the ones recorded in the database
@@ -291,29 +296,34 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 	defer l.mu.Unlock()
 
 	log.Printf("Incoming request: %+v", clb)
-	if _, err := l.db.Get([]byte(clb.Name)); err != nil && err != rosedb.ErrKeyNotFound {
+	return l.createLocked(clb.Name, clb.IpAddr)
+}
+
+// createLocked creates a new, empty load balancer. The caller holds l.mu.
+func (l *loadBalancerServer) createLocked(name string, requestedIP *string) (*LoadBalancerInformation, error) {
+	if _, err := l.db.Get([]byte(name)); err != nil && err != rosedb.ErrKeyNotFound {
 		return nil, err
 	} else if err == nil {
-		return nil, fmt.Errorf("loadbalancer called %s already exists", clb.Name)
+		return nil, fmt.Errorf("loadbalancer called %s already exists", name)
 	}
 
 	// Take a reference on the address, either a free one or the one requested.
 	// An address that is already held by another load balancer is shared.
 	var ip net.IP
-	if clb.IpAddr == nil || *clb.IpAddr == "" {
+	if requestedIP == nil || *requestedIP == "" {
 		var err error
 		if ip, err = l.ipam.Allocate(); err != nil {
 			return nil, err
 		}
 	} else {
-		ip = net.ParseIP(*clb.IpAddr)
+		ip = net.ParseIP(*requestedIP)
 		if err := l.ipam.Reserve(ip); err != nil {
 			return nil, err
 		}
 	}
 
 	lbInfo := &LoadBalancerInformation{
-		Name:    clb.Name,
+		Name:    name,
 		IpAddr:  ip.String(),
 		Targets: map[int32]*TargetList{},
 	}
@@ -326,15 +336,19 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 		return nil, err
 	}
 
-	lbInfoData, err := json.Marshal(lbInfo)
-	if err == nil {
-		err = l.db.Put([]byte(clb.Name), lbInfoData)
-	}
-	if err != nil {
+	if err := l.saveLB(lbInfo); err != nil {
 		l.releaseAddr(ip)
 		return nil, err
 	}
 	return lbInfo, nil
+}
+
+func (l *loadBalancerServer) saveLB(lb *LoadBalancerInformation) error {
+	data, err := json.Marshal(lb)
+	if err != nil {
+		return err
+	}
+	return l.db.Put([]byte(lb.Name), data)
 }
 
 // releaseAddr drops a reference on the address, and removes it from the

@@ -16,6 +16,11 @@ service LoadBalancer {
    rpc Create(CreateLoadBalancer) returns (LoadBalancerInformation);
    rpc Delete(LoadBalancerName) returns (Error);
 
+   // Apply makes the named load balancer match the request: it is created if it
+   // doesn't exist, targets that are missing are added and targets that are not
+   // in the request are removed. Repeating the same request changes nothing.
+   rpc Apply(ApplyRequest) returns (ApplyResult);
+
    rpc AddTarget(AddTargetRequest) returns (Error);
    rpc DelTarget(DelTargetRequest) returns (Error);
 }
@@ -62,6 +67,25 @@ message Target {
    Protocol protocol = 1;
    string dstIP = 2;
    int32 dstPort = 3;
+   // If not zero, the target is health checked with an HTTP GET of /healthz on
+   // this port (the healthCheckNodePort of Services with externalTrafficPolicy
+   // Local); a 200 answer means healthy. Otherwise a TCP connect to dstPort is used.
+   int32 healthCheckPort = 4;
+}
+
+message ApplyRequest {
+   string name = 1;
+   // If an ip_addr is requested, try to use it. Otherwise, an unused IP will be allocated.
+   // It can't be changed once the load balancer exists.
+   optional string ip_addr = 2;
+   // The complete desired targets, by source port
+   map<int32,TargetList> targets = 3;
+}
+
+message ApplyResult {
+   LoadBalancerInformation info = 1;
+   // Problems per source port. Ports that were applied cleanly are not listed.
+   map<int32,string> port_errors = 2;
 }
 
 message TargetList {

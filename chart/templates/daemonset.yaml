@@ -43,7 +43,6 @@ spec:
           - /proxmox-cloud-controller-manager
           - --cloud-provider=proxmox  # Add your own cloud provider here!
           - --leader-elect=true
-          - --use-service-account-credentials
           - --configure-cloud-routes=false
           - --cloud-config=/etc/proxmox/cloud-config.yaml
           volumeMounts:

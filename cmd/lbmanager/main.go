@@ -111,6 +111,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	lbServer.StartHealthChecks(ctx)
+	if err := lbServer.ServeMetrics(ctx, k.String("metrics.listen")); err != nil {
+		log.Fatalf("failed starting the metrics endpoint: %v", err)
+	}
 	opts := []grpc.ServerOption{
 		grpc.Creds(creds),
 	}

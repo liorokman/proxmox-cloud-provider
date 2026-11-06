@@ -1,6 +1,7 @@
 package proxmox
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/luthermonson/go-proxmox"
@@ -58,5 +59,51 @@ func TestGetProviderID(t *testing.T) {
 	vm := &proxmox.VirtualMachine{Node: "pve1", VMID: 1101}
 	if got := getProviderID(vm); got != "proxmox:///pve1/1101" {
 		t.Errorf("got %s", got)
+	}
+}
+
+func TestAgentAddresses(t *testing.T) {
+	cfg := &proxmox.VirtualMachineConfig{
+		Name: "node1",
+		Nets: map[string]string{
+			"net0": "virtio=BC:24:11:AA:BB:CC,bridge=cluster1",
+			"net1": "virtio=bc:24:11:00:00:01,bridge=vmbr0,firewall=1",
+		},
+	}
+	ifaces := []*proxmox.AgentNetworkIface{
+		{Name: "ens18", HardwareAddress: "bc:24:11:aa:bb:cc", IPAddresses: []*proxmox.AgentNetworkIPAddress{
+			{IPAddressType: "ipv4", IPAddress: "192.168.20.3"},
+			{IPAddressType: "ipv6", IPAddress: "fe80::1"},
+			{IPAddressType: "ipv4", IPAddress: "169.254.1.1"},
+		}},
+		{Name: "flannel.1", HardwareAddress: "aa:00:00:00:00:01", IPAddresses: []*proxmox.AgentNetworkIPAddress{{IPAddressType: "ipv4", IPAddress: "10.244.0.0"}}},
+		{Name: "ens19", HardwareAddress: "BC:24:11:00:00:01", IPAddresses: []*proxmox.AgentNetworkIPAddress{{IPAddressType: "ipv4", IPAddress: "192.168.67.9"}}},
+	}
+	got := nodeAddresses(cfg, ifaces)
+	want := []v1.NodeAddress{
+		{Type: v1.NodeInternalIP, Address: "192.168.20.3"},
+		{Type: v1.NodeInternalIP, Address: "192.168.67.9"},
+		{Type: v1.NodeHostName, Address: "node1"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+	// Without agent data the static settings are used
+	cfg.IPConfigs = map[string]string{"ipconfig0": "ip=192.168.20.7/24,gw=192.168.20.1"}
+	got = nodeAddresses(cfg, nil)
+	if len(got) != 2 || got[0].Address != "192.168.20.7" {
+		t.Errorf("fallback: %+v", got)
+	}
+}
+
+func TestInstanceType(t *testing.T) {
+	for _, c := range []struct {
+		cpus int
+		mem  uint64
+		want string
+	}{{4, 8 << 30, "4c-8g"}, {2, 1536 << 20, "2c-1536m"}, {0, 0, "qemu"}} {
+		if got := instanceType(c.cpus, c.mem); got != c.want {
+			t.Errorf("instanceType(%d,%d) = %s, want %s", c.cpus, c.mem, got, c.want)
+		}
 	}
 }

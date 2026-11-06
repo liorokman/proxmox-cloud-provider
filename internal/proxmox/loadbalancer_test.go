@@ -10,21 +10,22 @@ import (
 	"github.com/liorokman/proxmox-cloud-provider/internal/loadbalancer"
 )
 
-// fakeLBClient records the target changes requested by the provider
 type fakeLBClient struct {
 	loadbalancer.LoadBalancerClient
-	added   []targetKey
-	removed []targetKey
+	applied []*loadbalancer.ApplyRequest
+	errors  map[int32]string
 }
 
-func (f *fakeLBClient) AddTarget(_ context.Context, in *loadbalancer.AddTargetRequest, _ ...grpc.CallOption) (*loadbalancer.Error, error) {
-	f.added = append(f.added, newTargetKey(in.Target, in.SrcPort))
-	return &loadbalancer.Error{}, nil
+func (f *fakeLBClient) Apply(_ context.Context, in *loadbalancer.ApplyRequest, _ ...grpc.CallOption) (*loadbalancer.ApplyResult, error) {
+	f.applied = append(f.applied, in)
+	return &loadbalancer.ApplyResult{
+		Info:       &loadbalancer.LoadBalancerInformation{Name: in.Name, IpAddr: "192.168.87.210"},
+		PortErrors: f.errors,
+	}, nil
 }
 
-func (f *fakeLBClient) DelTarget(_ context.Context, in *loadbalancer.DelTargetRequest, _ ...grpc.CallOption) (*loadbalancer.Error, error) {
-	f.removed = append(f.removed, newTargetKey(in.Target, in.SrcPort))
-	return &loadbalancer.Error{}, nil
+func (f *fakeLBClient) GetLoadBalancer(_ context.Context, in *loadbalancer.LoadBalancerName, _ ...grpc.CallOption) (*loadbalancer.LoadBalancerInformation, error) {
+	return &loadbalancer.LoadBalancerInformation{}, nil
 }
 
 func testNode(ip string) *v1.Node {
@@ -34,56 +35,49 @@ func testNode(ip string) *v1.Node {
 func testService() *v1.Service {
 	return &v1.Service{Spec: v1.ServiceSpec{Ports: []v1.ServicePort{
 		{Port: 80, NodePort: 30080, Protocol: v1.ProtocolTCP},
-		{Port: 443, NodePort: 30443, Protocol: v1.ProtocolTCP},
+		{Port: 53, NodePort: 30053, Protocol: v1.ProtocolUDP},
+		{Port: 9, NodePort: 30009, Protocol: v1.ProtocolSCTP},
 	}}}
 }
 
-func lbInfoWith(targets map[int32][]*loadbalancer.Target) *loadbalancer.LoadBalancerInformation {
-	info := &loadbalancer.LoadBalancerInformation{Name: "lb", IpAddr: "192.168.87.210", Targets: map[int32]*loadbalancer.TargetList{}}
-	for port, list := range targets {
-		info.Targets[port] = &loadbalancer.TargetList{Target: list}
+func TestDesiredState(t *testing.T) {
+	req, ports := desiredState("lb", testService(), []*v1.Node{testNode("192.168.100.5"), testNode("192.168.100.6"), {}})
+	if len(req.Targets) != 2 || len(req.Targets[80].Target) != 2 || len(req.Targets[53].Target) != 2 {
+		t.Fatalf("unexpected targets: %+v", req.Targets)
 	}
-	return info
-}
-
-// A resync of an already configured multi-port service must not touch anything
-func TestHandleMappingsIsStable(t *testing.T) {
-	fake := &fakeLBClient{}
-	lb := &LoadBalancer{client: fake}
-	info := lbInfoWith(map[int32][]*loadbalancer.Target{
-		80:  {{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.5", DstPort: 30080}},
-		443: {{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.5", DstPort: 30443}},
-	})
-	lb.handleMappings(context.Background(), info, testService(), []*v1.Node{testNode("192.168.100.5")})
-	if len(fake.added) != 0 || len(fake.removed) != 0 {
-		t.Errorf("expected no changes, got added=%v removed=%v", fake.added, fake.removed)
+	if req.Targets[53].Target[0].Protocol != loadbalancer.Protocol_UDP || req.Targets[80].Target[1].DstIP != "192.168.100.6" ||
+		req.Targets[80].Target[0].DstPort != 30080 || req.Targets[80].Target[0].HealthCheckPort != 0 {
+		t.Errorf("unexpected target: %+v", req.Targets)
+	}
+	if len(ports) != 3 || ports[2].Error == nil || ports[0].Error != nil {
+		t.Errorf("unexpected port status: %+v", ports)
 	}
 }
 
-// A node that left the cluster must be removed from every port, and nothing else
-func TestHandleMappingsRemovesStaleNode(t *testing.T) {
-	fake := &fakeLBClient{}
+func TestDesiredStateLocalPolicy(t *testing.T) {
+	svc := testService()
+	svc.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyLocal
+	svc.Spec.HealthCheckNodePort = 32000
+	req, _ := desiredState("lb", svc, []*v1.Node{testNode("192.168.100.5")})
+	if got := req.Targets[80].Target[0].HealthCheckPort; got != 32000 {
+		t.Errorf("health check port = %d", got)
+	}
+}
+
+func TestEnsureLoadBalancerAppliesOnceAndReportsPortErrors(t *testing.T) {
+	fake := &fakeLBClient{errors: map[int32]string{80: "conflict"}}
 	lb := &LoadBalancer{client: fake}
-	info := lbInfoWith(map[int32][]*loadbalancer.Target{
-		80: {
-			{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.5", DstPort: 30080},
-			{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.6", DstPort: 30080},
-		},
-		443: {
-			{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.5", DstPort: 30443},
-			{Protocol: loadbalancer.Protocol_TCP, DstIP: "192.168.100.6", DstPort: 30443},
-		},
-	})
-	lb.handleMappings(context.Background(), info, testService(), []*v1.Node{testNode("192.168.100.5")})
-	if len(fake.added) != 0 {
-		t.Errorf("unexpected additions: %v", fake.added)
+	svc := testService()
+	svc.Spec.LoadBalancerIP = "192.168.87.220"
+	status, err := lb.EnsureLoadBalancer(context.Background(), "c", svc, []*v1.Node{testNode("192.168.100.5")})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(fake.removed) != 2 {
-		t.Errorf("expected the two mappings of the departed node to be removed, got %v", fake.removed)
+	if len(fake.applied) != 1 || fake.applied[0].GetIpAddr() != "192.168.87.220" {
+		t.Fatalf("unexpected apply calls: %+v", fake.applied)
 	}
-	for _, r := range fake.removed {
-		if r.IP != "192.168.100.6" {
-			t.Errorf("removed a mapping of a node that is still present: %v", r)
-		}
+	ing := status.Ingress[0]
+	if ing.IP != "192.168.87.210" || ing.Ports[0].Error == nil || *ing.Ports[0].Error != "conflict" || ing.Ports[1].Error != nil {
+		t.Errorf("unexpected status %+v", ing)
 	}
 }

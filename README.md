@@ -71,13 +71,14 @@ using this cloud controller provider:
 
 1. Prepare an API token for the Proxmox Cloud Provider
 
-   The cloud provider only reads information about virtual machines, so it
-   needs a read-only role. The following creates a dedicated user, role and
+   The cloud provider only reads information about virtual machines (and asks
+   their QEMU guest agent for the network addresses), so it needs a read-only
+   role. The following creates a dedicated user, role and
    token (with privilege separation turned off, so that the token inherits the
    user's permissions):
 
    ```bash
-   pveum role add K8sCCM -privs "VM.Audit Sys.Audit"
+   pveum role add K8sCCM -privs "VM.Audit Sys.Audit VM.GuestAgent.Audit"
    pveum user add ccm@pve --comment "Kubernetes cloud controller"
    pveum acl modify / --users ccm@pve --roles K8sCCM
    pveum user token add ccm@pve ccm --privsep 0
@@ -153,15 +154,24 @@ will be fixed in future versions of this project.
    in the Kubernetes nodes subnet.
 
    Make sure to run the container as a privileged container - this is required
-   for `ipvs` to work from inside the container. 
+   for `ipvs` to work from inside the container.
+
+   The container has three network interfaces: `eth0` for management (the
+   address of `lbctl` and the gRPC API, with its own `$LB_MGMT_IP`), `eth1` in
+   the Kubernetes nodes subnet, and `eth2` on the main network. `eth2` is moved
+   into the load balancer's network namespace and carries `$LB_EXT_IP` and all
+   the virtual IPs, so it has no address in the Proxmox configuration.
+   (Without an `eth2`, the script falls back to the older layout: `eth0` has
+   `$LB_EXT_IP` and is bridged into the namespace.)
 
    ```bash
       DESCRIPTION="{\"ip\":\"$LB_EXT_IP\",\"mask\":24,\"start\":\"$LB_EXT_START\",\"end\":\"$LB_EXT_END\"}"
       pct create 1100  local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst  \
           -unprivileged 0 \
           -cores 2 -swap 0 -memory 512 -hostname k8slb1  \
-          -net0 name=eth0,bridge=vmbr0,firewall=1,ip=$LB_EXT_IP/$EXT_CIDR,gw=$EXT_GW,type=veth \
+          -net0 name=eth0,bridge=vmbr0,firewall=1,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW,type=veth \
           -net1 name=eth1,bridge=k8s,firewall=1,ip=192.168.50.1/24,type=veth \
+          -net2 name=eth2,bridge=vmbr0,firewall=1,type=veth \
           -ostype debian  -features nesting=1 \
           -password=$PASSWORD  -storage $STORAGE \
           -description $DESCRIPTION
@@ -172,7 +182,9 @@ will be fixed in future versions of this project.
    container was created, and make it executable.
 
    The script downloads the `lbmanager` and `lbctl` binaries from the GitHub
-   release set in the `LBMANAGER_VERSION` environment variable. To use binaries that you
+   release set in the `LBMANAGER_VERSION` environment variable, and refuses
+   them unless they match the release's `SHA256SUMS`. The tools it installs
+   (and no upgrades) are only fetched when they are missing. To use binaries that you
    built yourself instead, place `lbmanager` and `lbctl` in the same snippets
    directory, next to the script. They take precedence over the download.
 

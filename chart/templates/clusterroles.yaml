@@ -1,17 +1,102 @@
+# The permissions of the cloud controller manager: the node, route-less cloud
+# node lifecycle and service controllers, plus leader election and the
+# delegated authentication of its secure port.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "chart.name" . }}-controller
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["nodes/status"]
+  verbs: ["patch", "update"]
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["services/status"]
+  verbs: ["patch", "update"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "chart.name" . }}
+  name: {{ include "chart.name" . }}-controller
   labels:
     {{- include "chart.labels" . | nindent 4 }}
-
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: cluster-admin
+  name: {{ include "chart.name" . }}-controller
 subjects:
 - kind: ServiceAccount
   name: {{ include "chart.serviceAccountName" . }}
   namespace: {{ .Release.Namespace }}
-
+---
+# Token and access reviews for the secure port
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "chart.name" . }}-auth-delegator
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: {{ include "chart.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+# Leader election, in the namespace where the lease lives
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "chart.name" . }}-leader-election
+  namespace: kube-system
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "chart.name" . }}-leader-election
+  namespace: kube-system
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "chart.name" . }}-leader-election
+subjects:
+- kind: ServiceAccount
+  name: {{ include "chart.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+# Read the client CA of the API server's aggregation layer
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "chart.name" . }}-authentication-reader
+  namespace: kube-system
+  labels:
+    {{- include "chart.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+- kind: ServiceAccount
+  name: {{ include "chart.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}

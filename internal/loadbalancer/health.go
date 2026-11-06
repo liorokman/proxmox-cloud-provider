@@ -1,11 +1,13 @@
 package loadbalancer
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -96,15 +98,34 @@ func (h *healthTracker) forget(keep map[string]bool) {
 }
 
 func healthKey(t *Target) string {
-	return fmt.Sprintf("%d/%s", t.Protocol, net.JoinHostPort(t.DstIP, fmt.Sprint(t.DstPort)))
+	return fmt.Sprintf("%d/%s/%d", t.Protocol, net.JoinHostPort(t.DstIP, fmt.Sprint(t.DstPort)), t.HealthCheckPort)
 }
 
 // weightFor is the IPVS weight a target should have right now. Caller holds l.mu.
 func (l *loadBalancerServer) weightFor(t *Target) int {
-	if l.health != nil && !l.health.isHealthy(healthKey(t)) {
+	if l.health == nil {
+		return 1
+	}
+	key := healthKey(t)
+	if !l.health.isHealthy(key) {
 		return 0
 	}
+	// A target that is checked through a health check port (externalTrafficPolicy
+	// Local) only gets traffic after it reported that it has endpoints
+	if t.HealthCheckPort != 0 {
+		if _, known := l.health.state[key]; !known {
+			return 0
+		}
+	}
 	return 1
+}
+
+// kickHealthChecks asks for a probe round right away, e.g. after targets were added.
+func (l *loadBalancerServer) kickHealthChecks() {
+	select {
+	case l.kick <- struct{}{}:
+	default:
+	}
 }
 
 // tcpProber connects to targets from inside the namespace, using a fixed set
@@ -115,7 +136,7 @@ type tcpProber struct {
 }
 
 type probeJob struct {
-	addr   string
+	target *Target
 	result chan<- bool
 }
 
@@ -131,20 +152,43 @@ func newTCPProber(ns netns.NsHandle, timeout time.Duration) *tcpProber {
 				return
 			}
 			for job := range p.jobs {
-				c, err := net.DialTimeout("tcp", job.addr, p.timeout)
-				if err == nil {
-					c.Close()
-				}
-				job.result <- err == nil
+				job.result <- p.check(job.target)
 			}
 		}()
 	}
 	return p
 }
 
-func (p *tcpProber) probe(addr string) bool {
+// check runs on a goroutine whose thread is inside the namespace, so everything
+// that needs a socket has to happen here and not in net/http.
+func (p *tcpProber) check(t *Target) bool {
+	port := t.DstPort
+	if t.HealthCheckPort != 0 {
+		port = t.HealthCheckPort
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(t.DstIP, fmt.Sprint(port)), p.timeout)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	if t.HealthCheckPort == 0 {
+		return true
+	}
+	c.SetDeadline(time.Now().Add(p.timeout))
+	if _, err := fmt.Fprintf(c, "GET /healthz HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", t.DstIP); err != nil {
+		return false
+	}
+	status, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(status)
+	return len(fields) >= 2 && strings.HasPrefix(fields[0], "HTTP/") && fields[1] == "200"
+}
+
+func (p *tcpProber) probe(t *Target) bool {
 	res := make(chan bool, 1)
-	p.jobs <- probeJob{addr: addr, result: res}
+	p.jobs <- probeJob{target: t, result: res}
 	return <-res
 }
 
@@ -158,6 +202,7 @@ func (l *loadBalancerServer) runHealthChecks(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		case <-l.kick:
 		}
 	}
 }
@@ -166,20 +211,15 @@ func (l *loadBalancerServer) runHealthChecks(ctx context.Context) {
 // those whose state changed.
 func (l *loadBalancerServer) checkHealthOnce() {
 	// Snapshot the targets, so the probes run without holding the lock
-	type probeTarget struct {
-		key  string
-		addr string
-	}
 	l.mu.Lock()
-	toProbe := map[string]probeTarget{}
+	toProbe := map[string]*Target{}
 	l.forEachLB(func(lb *LoadBalancerInformation) {
 		for _, tl := range lb.Targets {
 			for _, t := range tl.GetTarget() {
 				if t.Protocol != Protocol_TCP {
 					continue
 				}
-				k := healthKey(t)
-				toProbe[k] = probeTarget{key: k, addr: net.JoinHostPort(t.DstIP, fmt.Sprint(t.DstPort))}
+				toProbe[healthKey(t)] = t
 			}
 		}
 	})
@@ -188,13 +228,13 @@ func (l *loadBalancerServer) checkHealthOnce() {
 	var wg sync.WaitGroup
 	results := make(map[string]bool, len(toProbe))
 	var rmu sync.Mutex
-	for _, pt := range toProbe {
+	for key, pt := range toProbe {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ok := l.probe(pt.addr)
+			ok := l.probe(pt)
 			rmu.Lock()
-			results[pt.key] = ok
+			results[key] = ok
 			rmu.Unlock()
 		}()
 	}

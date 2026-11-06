@@ -32,8 +32,14 @@ that share one binary only at the Kubernetes side:
 resources, first by the `providerID` (`proxmox:///<pve node>/<vmid>`), and
 otherwise by the VM name. It reports:
 
-* the provider ID, the Proxmox node as the zone, and the node addresses (taken
-  from the VM's static `ipconfigN` cloud-init settings and its name);
+* the provider ID, the Proxmox node as the zone, the Proxmox cluster as the
+  region, and an instance type derived from the VM's size (for example
+  `4c-8g`). Labels are only set when a node registers;
+* the node addresses: the IPv4 addresses that the QEMU guest agent reports on
+  the VM's own network interfaces (matched by MAC address, so pod and bridge
+  interfaces are ignored). This works with DHCP. Without a running agent (or
+  the `VM.GuestAgent.Audit` privilege), the static `ipconfigN` cloud-init
+  settings are used. The VM's name is always the hostname;
 * whether the VM exists and whether it is running.
 
 `InstanceExists` only returns `false` when the VM does not exist. Any other
@@ -41,7 +47,10 @@ failure (for example, the Proxmox API being unreachable) is returned as an
 error, since a `false` answer makes Kubernetes delete the Node object.
 
 The Proxmox client is [luthermonson/go-proxmox](https://github.com/luthermonson/go-proxmox).
-The API token only needs the `VM.Audit` and `Sys.Audit` privileges.
+The API token only needs the `VM.Audit`, `Sys.Audit` and `VM.GuestAgent.Audit` privileges.
+The Helm chart gives the cloud provider a narrow cluster role (nodes, services
+and events, plus leader election and delegated authentication) instead of
+`cluster-admin`.
 
 ## Load balancing
 
@@ -66,8 +75,17 @@ new connections, existing ones continue), and gets weight 1 again after `rise`
 successful probes.
 
 `EnsureLoadBalancer` and `UpdateLoadBalancer` compute the complete set of
-wanted targets over all ports and nodes, add the missing ones, and remove
-everything else. Control plane nodes are not targets, because the Kubernetes
+wanted targets over all ports and nodes and send it to `lbmanager` in one
+declarative `Apply` call. `lbmanager` creates the load balancer if needed, adds
+the missing targets, removes everything else, and saves the result in one
+step, under its mutex. Repeating a call changes nothing, and a problem with
+one port (reported in `PortErrors`) does not stop the others. The older
+`Create`, `AddTarget`, `DelTarget` calls remain for `lbctl`.
+
+For `externalTrafficPolicy: Local` each target also carries the Service's
+`healthCheckNodePort`. `lbmanager` then checks `GET /healthz` there instead of
+a TCP connect to the NodePort, so only nodes with local endpoints get traffic
+(weight 0 otherwise, and until the first check passes). Control plane nodes are not targets, because the Kubernetes
 service controller does not pass nodes that carry the
 `node.kubernetes.io/exclude-from-external-load-balancers` label.
 
@@ -89,6 +107,14 @@ the destination, and the replies return through the container because it is
 the nodes' default gateway. Connections that start *inside* the VNet (including
 the nodes talking to the API server's VIP) are masqueraded so that the reply
 also passes through the container.
+
+### Metrics
+
+With `metrics.listen` set in `lbmanager.yaml` (the hookscript uses the
+management address, port 9100), `lbmanager` serves Prometheus metrics on
+`/metrics`, without authentication: per virtual service the connections,
+packets and bytes, and per target its weight (0 = failed its health check),
+active and inactive connections and traffic.
 
 ### Security
 
@@ -117,10 +143,8 @@ gateway.
 * The VIP range is managed by `lbmanager` itself and is not known to Proxmox
   IPAM, the DHCP server of the LAN, or other hosts. Pick a range that is
   reserved.
-* Node addresses are only discovered from static cloud-init `ipconfigN`
-  settings. VMs that get their addresses by DHCP are not supported.
 * Only IPv4 and TCP/UDP are tested.
-* The Helm chart binds the cloud provider to the `cluster-admin` role.
+* The cloud provider needs an `lbmanager` that has the `Apply` call (this release or newer).
 
 ## Possible next steps
 
@@ -128,8 +152,6 @@ See [roadmap.md](roadmap.md) for the prioritized list.
 
 
 1. Discover node addresses through the QEMU guest agent or Proxmox IPAM.
-2. Narrow the RBAC rules of the chart to what the CCM needs.
-3. Support more than one load balancer, for high availability.
-4. Support `externalTrafficPolicy: Local`.
-5. Publish container images and binaries with checksums, and download them
+2. Support more than one load balancer, for high availability.
+3. Publish container images and binaries with checksums, and download them
    verified in `installLB.sh`.
