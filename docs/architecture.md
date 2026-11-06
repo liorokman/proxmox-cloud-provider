@@ -112,10 +112,13 @@ gateway.
 
 ## Possible next steps
 
+See [roadmap.md](roadmap.md) for the prioritized list.
+
+
 1. Discover node addresses through the QEMU guest agent or Proxmox IPAM.
 2. Allocate VIPs from Proxmox IPAM.
 3. Narrow the RBAC rules of the chart to what the CCM needs.
 4. Support more than one load balancer, for high availability.
-5. Honour the `externalTrafficPolicy` and node exclusion labels in the load balancer.
+5. Support `externalTrafficPolicy: Local`, and health check the targets.
 6. Publish container images and binaries with checksums, and download them
    verified in `installLB.sh`.
