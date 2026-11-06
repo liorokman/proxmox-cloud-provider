@@ -3,9 +3,11 @@ package loadbalancer
 import (
 	context "context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"syscall"
 
 	"github.com/knadh/koanf/v2"
@@ -29,6 +31,7 @@ const (
 	ErrTargetAlreadyMapped  = (1 << 5)
 	ErrTargetNotMapped      = (1 << 6)
 	ErrIPAMError            = (1 << 7)
+	ErrPortConflict         = (1 << 8)
 )
 
 var (
@@ -38,6 +41,10 @@ var (
 type loadBalancerServer struct {
 	UnimplementedLoadBalancerServer
 
+	// mu serializes every request: each one reads, changes IPVS and the
+	// netlink state, and writes the database record.
+	mu sync.Mutex
+
 	cidr         *netlink.Addr
 	db           *rosedb.DB
 	externalLink netlink.Link
@@ -45,12 +52,20 @@ type loadBalancerServer struct {
 	nlHandle     *netlink.Handle
 	ipvsHandle   *ipvs.Handle
 	ipam         ipam.IPAM
+
+	// Health checking; the tracker is protected by mu
+	healthCfg healthConfig
+	health    *healthTracker
+	probe     func(addr string) bool
 }
 
 type Intf interface {
 	LoadBalancerServer
 	Close()
 	Restore() error
+	// StartHealthChecks probes the targets until ctx is done. It returns
+	// immediately if health checking is disabled.
+	StartHealthChecks(ctx context.Context)
 }
 
 func (l *loadBalancerServer) Close() {
@@ -97,7 +112,21 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		ns.Close()
 		return nil, err
 	}
-	ipManagement, err := ipam.New(config, netlinkHandle, netIf)
+	// Addresses that are configured on the interface, but not held by a load
+	// balancer, belong to somebody else (the container itself, for example)
+	isBusy := func(ip net.IP) bool {
+		addrs, err := netlinkHandle.AddrList(netIf, netlink.FAMILY_ALL)
+		if err != nil {
+			return true
+		}
+		for _, addr := range addrs {
+			if addr.IP.Equal(ip) {
+				return true
+			}
+		}
+		return false
+	}
+	ipManagement, err := ipam.New(config, isBusy)
 	if err != nil {
 		db.Close()
 		ipvsHandle.Close()
@@ -114,7 +143,76 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		ipvsHandle:   ipvsHandle,
 		ipam:         ipManagement,
 	}
+	lbServer.healthCfg = readHealthConfig(config)
+	lbServer.health = newHealthTracker(lbServer.healthCfg.fall, lbServer.healthCfg.rise)
+	// The addresses in use are exactly the ones recorded in the database
+	if err := lbServer.forEachLB(func(lb *LoadBalancerInformation) {
+		ipManagement.Adopt(net.ParseIP(lb.IpAddr))
+	}); err != nil {
+		lbServer.Close()
+		return nil, err
+	}
 	return lbServer, nil
+}
+
+func readHealthConfig(config *koanf.Koanf) healthConfig {
+	cfg := healthConfig{
+		enabled:  true,
+		interval: defaultHealthInterval,
+		timeout:  defaultHealthTimeout,
+		fall:     defaultHealthFall,
+		rise:     defaultHealthRise,
+	}
+	if config.Exists("loadbalancer.healthCheck.enabled") {
+		cfg.enabled = config.Bool("loadbalancer.healthCheck.enabled")
+	}
+	if d := config.Duration("loadbalancer.healthCheck.interval"); d > 0 {
+		cfg.interval = d
+	}
+	if d := config.Duration("loadbalancer.healthCheck.timeout"); d > 0 {
+		cfg.timeout = d
+	}
+	if n := config.Int("loadbalancer.healthCheck.fall"); n > 0 {
+		cfg.fall = n
+	}
+	if n := config.Int("loadbalancer.healthCheck.rise"); n > 0 {
+		cfg.rise = n
+	}
+	return cfg
+}
+
+func (l *loadBalancerServer) StartHealthChecks(ctx context.Context) {
+	if !l.healthCfg.enabled {
+		log.Printf("health checks are disabled")
+		return
+	}
+	if l.probe == nil {
+		l.probe = newTCPProber(l.ns, l.healthCfg.timeout).probe
+	}
+	go l.runHealthChecks(ctx)
+}
+
+// forEachLB calls f for every load balancer record in the database. Records
+// that can't be decoded are logged and skipped.
+func (l *loadBalancerServer) forEachLB(f func(*LoadBalancerInformation)) error {
+	iter := l.db.NewIterator(rosedb.DefaultIteratorOptions)
+	defer iter.Close()
+	for ; iter.Valid(); iter.Next() {
+		val, err := iter.Value()
+		if err != nil {
+			return err
+		}
+		var curr LoadBalancerInformation
+		if err := json.Unmarshal(val, &curr); err != nil {
+			log.Printf("skipping an unreadable load balancer record %q: %v", iter.Key(), err)
+			continue
+		}
+		if curr.Targets == nil {
+			curr.Targets = map[int32]*TargetList{}
+		}
+		f(&curr)
+	}
+	return nil
 }
 
 func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol) *ipvs.Service {
@@ -136,51 +234,40 @@ func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol)
 	}
 }
 
-// Restore applies all the settings stored in the database to the current state
+// Restore applies all the settings stored in the database to the current
+// state. A load balancer that can't be restored is logged and skipped, so that
+// one bad record does not take down all the others.
 func (l *loadBalancerServer) Restore() error {
-	iterOptions := rosedb.DefaultIteratorOptions
-	iter := l.db.NewIterator(iterOptions)
-	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		val, err := iter.Value()
-		if err != nil {
-			return err
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.forEachLB(func(lb *LoadBalancerInformation) {
+		if err := l.ensureAddrAlias(lb.IpAddr); err != nil {
+			log.Printf("restore: load balancer %s: cannot configure address %s: %v", lb.Name, lb.IpAddr, err)
+			return
 		}
-		var currLB LoadBalancerInformation
-		if err := json.Unmarshal(val, &currLB); err != nil {
-			return err
-		}
-		if err := l.addAddrAlias(currLB.IpAddr); err != nil {
-			return err
-		}
-		for port, targets := range currLB.Targets {
-			if targets != nil {
-				for _, target := range targets.Target {
-					if _, err := l.mapTarget(&currLB, port, target); err != nil {
-						return err
-					}
+		for port, targets := range lb.Targets {
+			for _, target := range targets.GetTarget() {
+				if res, err := l.mapTarget(lb, port, target); err != nil {
+					log.Printf("restore: load balancer %s: port %d target %+v: %v", lb.Name, port, target, err)
+				} else if res != nil {
+					log.Printf("restore: load balancer %s: port %d target %+v: %s", lb.Name, port, target, res.Message)
 				}
 			}
 		}
-	}
-	return nil
+	})
 }
 
 // Get all information about all defined Load Balancers
 func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalancer_GetLoadBalancersServer) error {
-	iterOptions := rosedb.DefaultIteratorOptions
-	iter := l.db.NewIterator(iterOptions)
-	defer iter.Close()
-	for ; iter.Valid(); iter.Next() {
-		val, err := iter.Value()
-		if err != nil {
-			return err
-		}
-		var curr LoadBalancerInformation
-		if err := json.Unmarshal(val, &curr); err != nil {
-			return err
-		}
-		if err := stream.Send(&curr); err != nil {
+	l.mu.Lock()
+	all := []*LoadBalancerInformation{}
+	err := l.forEachLB(func(lb *LoadBalancerInformation) { all = append(all, lb) })
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	for _, lb := range all {
+		if err := stream.Send(lb); err != nil {
 			return err
 		}
 	}
@@ -189,6 +276,8 @@ func (l *loadBalancerServer) GetLoadBalancers(_ *emptypb.Empty, stream LoadBalan
 
 // Get information about a specific Load Balancer
 func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBalancerName) (*LoadBalancerInformation, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	curr, err := l.getLB(name.Name)
 	if err != nil && err != errNoSuchLoadbalancer {
@@ -198,6 +287,8 @@ func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBala
 }
 
 func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer) (*LoadBalancerInformation, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	log.Printf("Incoming request: %+v", clb)
 	if _, err := l.db.Get([]byte(clb.Name)); err != nil && err != rosedb.ErrKeyNotFound {
@@ -205,39 +296,63 @@ func (l *loadBalancerServer) Create(ctx context.Context, clb *CreateLoadBalancer
 	} else if err == nil {
 		return nil, fmt.Errorf("loadbalancer called %s already exists", clb.Name)
 	}
+
+	// Take a reference on the address, either a free one or the one requested.
+	// An address that is already held by another load balancer is shared.
+	var ip net.IP
 	if clb.IpAddr == nil || *clb.IpAddr == "" {
-		nextIP, err := l.ipam.Allocate()
-		if err != nil {
+		var err error
+		if ip, err = l.ipam.Allocate(); err != nil {
 			return nil, err
 		}
-		clb.IpAddr = asPtr(nextIP.String())
+	} else {
+		ip = net.ParseIP(*clb.IpAddr)
+		if err := l.ipam.Reserve(ip); err != nil {
+			return nil, err
+		}
 	}
 
 	lbInfo := &LoadBalancerInformation{
 		Name:    clb.Name,
-		IpAddr:  *clb.IpAddr,
+		IpAddr:  ip.String(),
 		Targets: map[int32]*TargetList{},
 	}
 
 	// Create a new alias on the interface that matches the required IP
 	// There could already be such an interface, since there might be another LB with the same IP and different port
-	if err := l.addAddrAlias(lbInfo.IpAddr); err != nil {
+	if err := l.ensureAddrAlias(lbInfo.IpAddr); err != nil {
 		log.Printf("error adding an alias for the loadbalancer %s: %s", lbInfo.Name, err.Error())
+		l.releaseAddr(ip)
 		return nil, err
 	}
 
 	lbInfoData, err := json.Marshal(lbInfo)
+	if err == nil {
+		err = l.db.Put([]byte(clb.Name), lbInfoData)
+	}
 	if err != nil {
+		l.releaseAddr(ip)
 		return nil, err
 	}
-	err = l.db.Put([]byte(clb.Name), lbInfoData)
-	return lbInfo, err
+	return lbInfo, nil
 }
 
-func (l *loadBalancerServer) addAddrAlias(addrString string) error {
+// releaseAddr drops a reference on the address, and removes it from the
+// interface when no load balancer holds it anymore.
+func (l *loadBalancerServer) releaseAddr(ip net.IP) error {
+	if l.ipam.Release(ip) > 0 {
+		return nil
+	}
+	return l.nlHandle.AddrDel(l.externalLink, &netlink.Addr{
+		IPNet: &net.IPNet{IP: ip, Mask: l.cidr.Mask},
+	})
+}
+
+// ensureAddrAlias makes sure the address is configured on the external interface.
+func (l *loadBalancerServer) ensureAddrAlias(addrString string) error {
 	externalIP := net.ParseIP(addrString)
-	if !l.ipam.Contains(externalIP) {
-		return fmt.Errorf("Requested IP %s is not contained in the configured CIDR (%s)", addrString, l.cidr)
+	if externalIP == nil {
+		return fmt.Errorf("invalid IP address %q", addrString)
 	}
 	requiredAddr := &netlink.Addr{
 		IPNet: &net.IPNet{
@@ -246,23 +361,21 @@ func (l *loadBalancerServer) addAddrAlias(addrString string) error {
 		},
 	}
 	addrs, err := l.nlHandle.AddrList(l.externalLink, netlink.FAMILY_ALL)
-	addrFound := false
+	if err != nil {
+		return err
+	}
 	for _, addr := range addrs {
-		addrFound = requiredAddr.Equal(addr)
-		if addrFound {
-			break
+		if requiredAddr.Equal(addr) {
+			return nil
 		}
 	}
-	if !addrFound {
-		err = l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
 }
 
 func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerName) (*Error, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	lbInfo, err := l.getLB(lbName.Name)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {
@@ -288,23 +401,11 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 		}
 	}
 
-	externalIP := net.ParseIP(lbInfo.IpAddr)
-	// 2. remove the IP alias
-	addrToDelete := &netlink.Addr{
-		IPNet: &net.IPNet{
-			IP:   externalIP,
-			Mask: l.cidr.Mask,
-		},
-	}
-	if err := l.nlHandle.AddrDel(l.externalLink, addrToDelete); err != nil {
+	// 2. release the address; it leaves the interface when nobody else holds it
+	if err := l.releaseAddr(net.ParseIP(lbInfo.IpAddr)); err != nil {
 		log.Printf("error removing the ip alias: %+v", err)
 		retErr.Message = retErr.Message + "\n" + err.Error()
 		retErr.Code |= ErrNoSuchIP
-	}
-	if err := l.ipam.Release(addrToDelete.IP); err != nil {
-		log.Printf("error unallocating the ip from ipam: %+v", err)
-		retErr.Message = retErr.Message + "\n" + err.Error()
-		retErr.Code |= ErrIPAMError
 	}
 
 	if err := l.db.Delete([]byte(lbName.Name)); err != nil {
@@ -315,6 +416,9 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 }
 
 func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetRequest) (*Error, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	lbInfo, err := l.getLB(atr.LbName)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {
@@ -326,6 +430,16 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 	if !found || targetList == nil {
 		targetList = &TargetList{
 			Target: []*Target{},
+		}
+	}
+	if len(targetList.Target) == 0 {
+		// The first target on this port creates the IPVS service. Another load
+		// balancer that shares the address must not already own it.
+		if other := l.portOwner(lbInfo, atr.SrcPort, atr.Target.Protocol); other != "" {
+			return &Error{
+				Message: fmt.Sprintf("%s port %d/%s is already used by load balancer %s", lbInfo.IpAddr, atr.SrcPort, atr.Target.Protocol, other),
+				Code:    ErrPortConflict,
+			}, nil
 		}
 	}
 	for _, target := range targetList.Target {
@@ -358,6 +472,24 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 	return &Error{}, err
 }
 
+// portOwner returns the name of another load balancer that has the same
+// address and serves the given port and protocol, or "" if there is none.
+func (l *loadBalancerServer) portOwner(lb *LoadBalancerInformation, port int32, protocol Protocol) string {
+	owner := ""
+	l.forEachLB(func(other *LoadBalancerInformation) {
+		if owner != "" || other.Name == lb.Name || other.IpAddr != lb.IpAddr {
+			return
+		}
+		for _, t := range other.Targets[port].GetTarget() {
+			if t.Protocol == protocol {
+				owner = other.Name
+				return
+			}
+		}
+	})
+	return owner
+}
+
 // mapTarget maps a given target to the provided loadbalancer on the provided
 // srcPort
 func (l *loadBalancerServer) mapTarget(lbInfo *LoadBalancerInformation, srcPort int32, target *Target) (*Error, error) {
@@ -377,9 +509,14 @@ func (l *loadBalancerServer) mapTarget(lbInfo *LoadBalancerInformation, srcPort 
 		Port:            uint16(target.DstPort),
 		ConnectionFlags: ipvs.ConnFwdMasq,
 		AddressFamily:   fam,
-		Weight:          1,
+		Weight:          l.weightFor(target),
 	}
-	if err := l.ipvsHandle.NewDestination(srv, newDestination); err != nil {
+	err := l.ipvsHandle.NewDestination(srv, newDestination)
+	if errors.Is(err, syscall.EEXIST) {
+		// Already programmed, as after a restart of lbmanager: make sure it matches
+		err = l.ipvsHandle.UpdateDestination(srv, newDestination)
+	}
+	if err != nil {
 		log.Printf("error adding a new destination %+v to service %+v: %+v", target, lbInfo, err)
 		return &Error{
 			Message: err.Error(),
@@ -390,6 +527,9 @@ func (l *loadBalancerServer) mapTarget(lbInfo *LoadBalancerInformation, srcPort 
 }
 
 func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetRequest) (*Error, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	lbInfo, err := l.getLB(dtr.LbName)
 	if err != nil {
 		if err == errNoSuchLoadbalancer {

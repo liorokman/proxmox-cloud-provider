@@ -54,6 +54,17 @@ Every `LoadBalancer` Service becomes one entry in `lbmanager`:
   Service's NodePort as destinations, using NAT forwarding and round robin
   scheduling.
 
+The VIP range is configured in `lbmanager.yaml` (`loadbalancer.ipam`): a
+`dynamicRange` for automatic allocation, and an optional `staticRange` for
+addresses that can only be requested with `loadBalancerIP`. Addresses outside
+both ranges, or in use by something else on the interface, are refused. Several
+Services can share a VIP on different ports.
+
+`lbmanager` probes every TCP target with a TCP connect from inside the `LB`
+namespace. A target that fails `fall` probes in a row gets IPVS weight 0 (no
+new connections, existing ones continue), and gets weight 1 again after `rise`
+successful probes.
+
 `EnsureLoadBalancer` and `UpdateLoadBalancer` compute the complete set of
 wanted targets over all ports and nodes, add the missing ones, and remove
 everything else. Control plane nodes are not targets, because the Kubernetes
@@ -100,6 +111,7 @@ gateway.
 
 ## Known limitations
 
+* Health checks are plain TCP connects, and UDP targets are not checked.
 * A single load balancer container is both ingress and egress for the
   cluster, so it is a single point of failure.
 * The VIP range is managed by `lbmanager` itself and is not known to Proxmox
@@ -116,9 +128,8 @@ See [roadmap.md](roadmap.md) for the prioritized list.
 
 
 1. Discover node addresses through the QEMU guest agent or Proxmox IPAM.
-2. Fix the built-in VIP allocator (Proxmox IPAM was evaluated and does not fit, see the road-map).
-3. Narrow the RBAC rules of the chart to what the CCM needs.
-4. Support more than one load balancer, for high availability.
-5. Support `externalTrafficPolicy: Local`, and health check the targets.
-6. Publish container images and binaries with checksums, and download them
+2. Narrow the RBAC rules of the chart to what the CCM needs.
+3. Support more than one load balancer, for high availability.
+4. Support `externalTrafficPolicy: Local`.
+5. Publish container images and binaries with checksums, and download them
    verified in `installLB.sh`.

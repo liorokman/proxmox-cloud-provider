@@ -26,19 +26,18 @@ func (p *LoadBalancer) GetLoadBalancer(ctx context.Context, clusterName string, 
 	lbInfo, err := p.client.GetLoadBalancer(ctx, &loadbalancer.LoadBalancerName{
 		Name: lbName,
 	})
-	if err != nil || lbInfo.Name == "" {
+	if err != nil || lbInfo.GetName() == "" {
 		return nil, false, err
 	}
 	for _, port := range service.Spec.Ports {
-		currPortError := ""
-		if tgt, found := lbInfo.Targets[port.Port]; !found || len(tgt.Target) == 0 {
-			currPortError = fmt.Sprintf("Port %d is not mapped", port.Port)
-		}
-		portStatus = append(portStatus, v1.PortStatus{
+		stat := v1.PortStatus{
 			Port:     port.Port,
-			Protocol: "TCP",
-			Error:    &currPortError,
-		})
+			Protocol: port.Protocol,
+		}
+		if tgt, found := lbInfo.Targets[port.Port]; !found || len(tgt.GetTarget()) == 0 {
+			stat.Error = asPtr(fmt.Sprintf("Port %d is not mapped", port.Port))
+		}
+		portStatus = append(portStatus, stat)
 	}
 	retval := &v1.LoadBalancerStatus{
 		Ingress: []v1.LoadBalancerIngress{
@@ -77,7 +76,10 @@ func (p *LoadBalancer) EnsureLoadBalancer(ctx context.Context, clusterName strin
 	lbinfo, err := p.client.GetLoadBalancer(ctx, &loadbalancer.LoadBalancerName{
 		Name: name,
 	})
-	if lbinfo == nil || lbinfo.Name == "" {
+	if err != nil {
+		return nil, err
+	}
+	if lbinfo.GetName() == "" {
 		// No such loadbalancer exists
 		lbinfo, err = p.client.Create(ctx, lbRequest)
 		log.Printf("Calling create for %+v", lbRequest)
@@ -108,9 +110,12 @@ func (p *LoadBalancer) UpdateLoadBalancer(ctx context.Context, clusterName strin
 	lbinfo, err := p.client.GetLoadBalancer(ctx, &loadbalancer.LoadBalancerName{
 		Name: name,
 	})
-	if lbinfo.Name == "" {
-		// No such loadbalancer exists
+	if err != nil {
 		return err
+	}
+	if lbinfo.GetName() == "" {
+		// No such loadbalancer exists
+		return nil
 	}
 	log.Printf("LBInfo: %+v", lbinfo)
 	p.handleMappings(ctx, lbinfo, service, nodes)

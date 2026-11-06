@@ -1,12 +1,16 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/knadh/koanf/parsers/yaml"
 	"github.com/knadh/koanf/providers/file"
@@ -104,6 +108,9 @@ func main() {
 	if err := lbServer.Restore(); err != nil {
 		log.Fatalf("failed restoring the loadbalancer configuration: %v", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	lbServer.StartHealthChecks(ctx)
 	opts := []grpc.ServerOption{
 		grpc.Creds(creds),
 	}
@@ -111,5 +118,18 @@ func main() {
 	grpcServer := grpc.NewServer(opts...)
 	loadbalancer.RegisterLoadBalancerServer(grpcServer, lbServer)
 	log.Println("Listening...")
-	grpcServer.Serve(lis)
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down...")
+		stopped := make(chan struct{})
+		go func() { grpcServer.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			grpcServer.Stop()
+		}
+	}()
+	if err := grpcServer.Serve(lis); err != nil {
+		log.Printf("serve: %v", err)
+	}
 }

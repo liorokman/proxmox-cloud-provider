@@ -2,194 +2,171 @@ package ipam
 
 import (
 	"fmt"
-	"log"
 	"net"
-	"strings"
+	"sync"
 
 	"github.com/knadh/koanf/v2"
-	"github.com/vishvananda/netlink"
 )
 
 var _ IPAM = &SimpleIpam{}
 
+// Range is an inclusive range of addresses.
 type Range struct {
 	From net.IP
 	To   net.IP
 }
 
-type SimpleIpam struct {
-	cidr         *net.IPNet
-	allowedRange Range
-	link         netlink.Link
-	nlHandle     *netlink.Handle
+// Contains reports whether ip is inside the range (inclusive).
+func (r Range) Contains(ip net.IP) bool {
+	if r.From == nil || r.To == nil || ip.IsUnspecified() {
+		return false
+	}
+	return bytesCompare(ip, r.From) >= 0 && bytesCompare(ip, r.To) <= 0
 }
 
-func New(config *koanf.Koanf, nlHandle *netlink.Handle, link netlink.Link) (IPAM, error) {
+// SimpleIpam allocates addresses from configured ranges. Which addresses are
+// taken is tracked in memory with reference counts, and rebuilt from the
+// load balancer records when the server starts. isBusy lets the caller veto
+// addresses that are in use by something else (for example, configured on the
+// interface by the host, such as the container's own address).
+type SimpleIpam struct {
+	mu           sync.Mutex
+	cidr         *net.IPNet
+	dynamicRange Range
+	staticRange  *Range
+	isBusy       func(net.IP) bool
+	refs         map[string]int
+}
+
+// New builds the allocator from the "loadbalancer.ipam" section of the
+// configuration:
+//
+//	cidr: the network of the addresses
+//	dynamicRange: addresses handed out automatically; also usable explicitly
+//	staticRange: (optional) more addresses that can only be requested explicitly
+func New(config *koanf.Koanf, isBusy func(net.IP) bool) (IPAM, error) {
 	_, cidr, err := net.ParseCIDR(config.MustString("loadbalancer.ipam.cidr"))
 	if err != nil {
 		return nil, err
 	}
-	dynamicRange := Range{
-		From: net.ParseIP(config.MustString("loadbalancer.ipam.dynamicRange.startAt")),
-		To:   net.ParseIP(config.MustString("loadbalancer.ipam.dynamicRange.endAt")),
-	}
-	if bytesCompare(dynamicRange.From, dynamicRange.To) >= 0 {
-		return nil, fmt.Errorf("invalid dynamic range provided: (%s, %s)", dynamicRange.From, dynamicRange.To)
-	}
-	if !cidr.Contains(dynamicRange.From) || !cidr.Contains(dynamicRange.To) {
-		return nil, fmt.Errorf("dynamic range (%s, %s) is not entirely contained in the cidr (%s)",
-			dynamicRange.From, dynamicRange.To, cidr)
-	}
-	return &SimpleIpam{
-		cidr:         cidr,
-		allowedRange: dynamicRange,
-		link:         link,
-		nlHandle:     nlHandle,
-	}, nil
-}
-
-func (r Range) Contains(ip net.IP) bool {
-	if ip.IsUnspecified() {
-		return false
-	}
-	if r.From.Equal(ip) || r.To.Equal(ip) {
-		return true
-	}
-
-	return bytesCompare(ip, r.From) >= 0 && bytesCompare(ip, r.To) <= 0
-}
-
-func (s *SimpleIpam) Contains(ip net.IP) bool {
-	return s.cidr.Contains(ip)
-}
-
-func (s *SimpleIpam) IsUsed(ip net.IP) bool {
-	addrs, err := s.nlHandle.AddrList(s.link, netlink.FAMILY_ALL)
-	if err != nil {
-		return true
-	}
-	return isUsed(ip, addrs)
-}
-
-func (s *SimpleIpam) Allocate() (net.IP, error) {
-	addrs, err := s.nlHandle.AddrList(s.link, netlink.FAMILY_ALL)
+	dynamic, err := parseRange(config, "loadbalancer.ipam.dynamicRange", cidr)
 	if err != nil {
 		return nil, err
 	}
-	ipTrie := newIPTrie()
-	for _, addr := range addrs {
-		ipTrie.Insert(addr.IP.To16())
-	}
-	currCandidate := s.allowedRange.From
-	for bytesCompare(currCandidate, s.allowedRange.To) <= 0 {
-		if !ipTrie.Contains(currCandidate) {
-			return currCandidate, nil
+	var static *Range
+	if config.Exists("loadbalancer.ipam.staticRange.startAt") {
+		r, err := parseRange(config, "loadbalancer.ipam.staticRange", cidr)
+		if err != nil {
+			return nil, err
 		}
-		currCandidate = getNextIP(currCandidate)
+		static = &r
 	}
-	return nil, fmt.Errorf("no free IP found in dynamic range")
+	if isBusy == nil {
+		isBusy = func(net.IP) bool { return false }
+	}
+	return &SimpleIpam{
+		cidr:         cidr,
+		dynamicRange: dynamic,
+		staticRange:  static,
+		isBusy:       isBusy,
+		refs:         map[string]int{},
+	}, nil
 }
 
-func (s *SimpleIpam) Release(ip net.IP) error {
-	// Not needed in the simple ipam, if the IP is released from the link
-	// then it will be available to be allocated
+func parseRange(config *koanf.Koanf, path string, cidr *net.IPNet) (Range, error) {
+	r := Range{
+		From: net.ParseIP(config.MustString(path + ".startAt")),
+		To:   net.ParseIP(config.MustString(path + ".endAt")),
+	}
+	if r.From == nil || r.To == nil || bytesCompare(r.From, r.To) > 0 {
+		return Range{}, fmt.Errorf("invalid range provided in %s: (%v, %v)", path, r.From, r.To)
+	}
+	if !cidr.Contains(r.From) || !cidr.Contains(r.To) {
+		return Range{}, fmt.Errorf("%s (%s, %s) is not entirely contained in the cidr (%s)", path, r.From, r.To, cidr)
+	}
+	return r, nil
+}
+
+func (s *SimpleIpam) allowed(ip net.IP) bool {
+	return s.dynamicRange.Contains(ip) || (s.staticRange != nil && s.staticRange.Contains(ip))
+}
+
+func (s *SimpleIpam) Allocate() (net.IP, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ip := s.dynamicRange.From; bytesCompare(ip, s.dynamicRange.To) <= 0; ip = getNextIP(ip) {
+		if s.refs[ip.String()] == 0 && !s.isBusy(ip) {
+			s.refs[ip.String()] = 1
+			return ip, nil
+		}
+	}
+	return nil, fmt.Errorf("no free IP found in the dynamic range (%s - %s)", s.dynamicRange.From, s.dynamicRange.To)
+}
+
+func (s *SimpleIpam) Reserve(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("invalid IP address")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.allowed(ip) {
+		return fmt.Errorf("requested IP %s is not inside the configured dynamic or static range", ip)
+	}
+	// An address already held by a load balancer is shared. Otherwise it must
+	// not be in use by something else.
+	if s.refs[ip.String()] == 0 && s.isBusy(ip) {
+		return fmt.Errorf("requested IP %s is already configured on the interface", ip)
+	}
+	s.refs[ip.String()]++
 	return nil
 }
 
-// Helper function to compare two net.IP addresses in byte form.
-// It returns -1 if a < b, 0 if a == b, and 1 if a > b.
-func bytesCompare(left, right net.IP) int {
-	leftBytes := left.To16()
-	rightBytes := right.To16()
+func (s *SimpleIpam) Adopt(ip net.IP) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refs[ip.String()]++
+}
 
+func (s *SimpleIpam) Release(ip net.IP) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := ip.String()
+	if s.refs[key] <= 1 {
+		delete(s.refs, key)
+		return 0
+	}
+	s.refs[key]--
+	return s.refs[key]
+}
+
+func (s *SimpleIpam) IsReserved(ip net.IP) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.refs[ip.String()] > 0
+}
+
+// bytesCompare compares two addresses in 16 byte form: -1 if left < right,
+// 0 if equal, 1 if left > right.
+func bytesCompare(left, right net.IP) int {
+	l, r := left.To16(), right.To16()
 	for i := 0; i < net.IPv6len; i++ {
-		if leftBytes[i] < rightBytes[i] {
+		if l[i] < r[i] {
 			return -1
-		} else if leftBytes[i] > rightBytes[i] {
+		} else if l[i] > r[i] {
 			return 1
 		}
 	}
 	return 0
 }
 
-func isUsed(ip net.IP, addrs []netlink.Addr) bool {
-	for _, addr := range addrs {
-		if ip.Equal(addr.IP) {
-			return true
-		}
-	}
-	return false
-}
-
 func getNextIP(ip net.IP) net.IP {
-	nextIP := make(net.IP, len(ip))
-	copy(nextIP, ip)
-
-	for i := len(nextIP) - 1; i >= 0; i-- {
-		nextIP[i]++
-		if nextIP[i] > 0 {
+	next := make(net.IP, len(ip))
+	copy(next, ip)
+	for i := len(next) - 1; i >= 0; i-- {
+		next[i]++
+		if next[i] > 0 {
 			break
 		}
 	}
-
-	return nextIP
-}
-
-type ipNode struct {
-	children map[byte]*ipNode
-	isEnd    bool
-}
-
-type ipTrie struct {
-	root *ipNode
-}
-
-// newIPTrie creates a new IPTrie.
-func newIPTrie() *ipTrie {
-	return &ipTrie{
-		root: &ipNode{
-			children: make(map[byte]*ipNode),
-		},
-	}
-}
-
-func (n *ipNode) printToLog(lvl int) {
-	if n == nil {
-		return
-	}
-	for k, v := range n.children {
-		log.Printf("%s %+v", strings.Repeat(" ", lvl), k)
-		v.printToLog(lvl + 1)
-	}
-}
-
-func (t *ipTrie) PrintToLog() {
-	t.root.printToLog(0)
-}
-
-// Insert adds an IP address to the trie.
-func (t *ipTrie) Insert(ip net.IP) {
-	node := t.root
-	for _, b := range ip {
-		if node.children[b] == nil {
-			node.children[b] = &ipNode{
-				children: make(map[byte]*ipNode),
-			}
-		}
-		node = node.children[b]
-	}
-	node.isEnd = true
-}
-
-// Contains checks if an IP address is present in the trie.
-func (t *ipTrie) Contains(ip net.IP) bool {
-	node := t.root
-	ip = ip.To16()
-	for _, b := range ip {
-		if node.children[b] == nil {
-			return false
-		}
-		node = node.children[b]
-	}
-	return node.isEnd
+	return next
 }

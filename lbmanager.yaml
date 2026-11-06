@@ -15,12 +15,17 @@ loadbalancer:
     
     # cidr is the network in which this IPAM operates
     cidr: 192.168.87.0/24
-    # dynamicRange is the range from which random LB addresses
-    # will be taken. 
-    # It's valid to explicitly ask for an IP address that is 
-    # outside this range, as long as it's inside the cidr.
-    # The entire dynamicRange must be contained in the cidr.
+    # dynamicRange is the range from which LB addresses are taken when
+    # a Service doesn't ask for a specific one. A specific address can also
+    # be requested from this range. The entire range must be contained
+    # in the cidr.
     dynamicRange:
       startAt: 192.168.87.200
       endAt:  192.168.87.225
-  
+    # staticRange (optional) holds more addresses that can only be requested
+    # explicitly (loadBalancerIP). Addresses outside both ranges are refused,
+    # so a Service can never claim the router's or another host's address.
+    # Exclude both ranges from the LAN's DHCP server.
+    staticRange:
+      startAt: 192.168.87.230
+      endAt: 192.168.87.240

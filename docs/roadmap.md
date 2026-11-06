@@ -78,12 +78,15 @@ Proxmox VE 9.2.
 
 ### P0: correctness
 
-1. Fix the built-in allocator: recorded allocations, explicit addresses only
+**Done** on the main branch (not released yet); verified with unit tests, the
+privileged tests on the devstack host, and the devstack cluster.
+
+1. ~~Fix the built-in allocator~~ (done): recorded allocations, explicit addresses only
    from configured ranges and never the container's own, reference counted
    shared addresses, no duplicate address, port and protocol. Document
    excluding the ranges from the LAN's DHCP server. **S–M**
-2. Health checks, with weight 0 for failed destinations. **M**
-3. A resilient `Restore`, a mutex, and the small bugs: the nil dereference in
+2. ~~Health checks, with weight 0 for failed destinations~~ (done). **M**
+3. ~~A resilient `Restore`, a mutex, and the small bugs~~ (done): the nil dereference in
    `UpdateLoadBalancer` and the hard coded TCP protocol in `GetLoadBalancer`. **S**
 
 ### P1: much more useful for little work
@@ -119,6 +122,24 @@ Proxmox VE 9.2.
     releases with checksums and a signed image. **S–M**
 17. An optional allocator backend that uses a real NetBox, which Proxmox can
     also use as the IPAM of the VNets. **M**
+
+Implementation notes for P0:
+
+* Allocations are reference counted in memory and rebuilt from the load
+  balancer records when `lbmanager` starts, so the database remains the single
+  source of truth. Explicit addresses must be inside `dynamicRange` or the new
+  optional `staticRange`, and are refused when configured on the interface by
+  someone else (the container's own address, for example).
+* Two load balancers can share an address, but not an address, port and
+  protocol (`ErrPortConflict`). The address leaves the interface only with its
+  last holder.
+* Health checks are TCP connects from inside the `LB` namespace
+  (`loadbalancer.healthCheck`: `enabled`, `interval` 5s, `timeout` 1s, `fall` 3,
+  `rise` 2). UDP targets are not checked.
+* Restoring after a restart of `lbmanager` is idempotent: IPVS entries that
+  survived are updated instead of failing. Before, any such restart ended in
+  `log.Fatalf`.
+* `lbmanager` now stops on SIGTERM; it used to ignore it until systemd killed it.
 
 If only three things get done: the allocator fixes, health checks, and guest
 agent addresses.
