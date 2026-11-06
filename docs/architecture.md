@@ -91,16 +91,24 @@ service controller does not pass nodes that carry the
 
 ### Network layout
 
-The container is created with two interfaces. `scripts/installLB.sh` is run as
-the container's hookscript, and on every start it:
+The container is created with three interfaces: `eth0` (management, in the
+root namespace), `eth1` (the VNet) and `eth2` (the LAN, without a Proxmox
+address). `scripts/installLB.sh` is run as the container's hookscript, and on
+every start it:
 
-1. creates the `LB` network namespace and moves the VNet interface (`eth1`) in;
-2. bridges the LAN interface (`eth0`) to a veth pair whose other end,
-   `external0`, is in the namespace;
+1. creates the `LB` network namespace and moves `eth1` and `eth2` in. `eth2`
+   carries the container's external address and every virtual IP. Without an
+   `eth2`, the script falls back to the older layout: `eth0` is bridged to a
+   veth pair whose other end, `external0`, is in the namespace;
+2. disables IPv6 on the external interface and turns on gratuitous ARP when
+   an address is added;
 3. enables forwarding and IPVS connection tracking in the namespace;
 4. configures source NAT so the container is the default gateway of the
    cluster to the LAN and the internet;
-5. creates a CA, the `lbmanager` and `lbctl` certificates, and a systemd unit.
+5. creates a CA, the `lbmanager` and `lbctl` certificates (once), and a
+   systemd unit;
+6. installs `lbmanager` and `lbctl`, from the snippets directory or from a
+   GitHub release verified against `SHA256SUMS`, and writes `lbmanager.yaml`.
 
 Traffic from outside the cluster keeps its source address: IPVS rewrites only
 the destination, and the replies return through the container because it is
@@ -148,10 +156,5 @@ gateway.
 
 ## Possible next steps
 
-See [roadmap.md](roadmap.md) for the prioritized list.
-
-
-1. Discover node addresses through the QEMU guest agent or Proxmox IPAM.
-2. Support more than one load balancer, for high availability.
-3. Publish container images and binaries with checksums, and download them
-   verified in `installLB.sh`.
+See [roadmap.md](roadmap.md) for the prioritized list. Upgrade instructions
+are in the [README](../README.md#upgrading).
