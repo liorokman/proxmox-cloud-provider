@@ -3,6 +3,10 @@
 VMID=$1; shift
 PHASE=$1; shift
 
+# The release to download lbmanager and lbctl from, unless they are provided next to this script
+LBMANAGER_VERSION=${LBMANAGER_VERSION:-v0.0.2}
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+
 urldecode () { 
     : "${*//+/ }";
     echo -e "${_//%/\\x}"
@@ -88,8 +92,11 @@ if [ ! -f /var/lib/lbmanagerca/ca.pem ]; then
 fi
 
 # 10. Install lbmanager 
-wget -q -O /usr/local/bin/lbmanager https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.2/lbmanager
-wget -q -O /usr/local/bin/lbctl https://github.com/liorokman/proxmox-cloud-provider/releases/download/v0.0.2/lbctl
+# The binaries are pushed from the snippets directory when they are present there,
+# otherwise they are downloaded from the release.
+for bin in lbmanager lbctl; do
+  [ -x /usr/local/bin/\$bin ] || wget -q -O /usr/local/bin/\$bin https://github.com/liorokman/proxmox-cloud-provider/releases/download/$LBMANAGER_VERSION/\$bin
+done
 chmod +x /usr/local/bin/lbmanager /usr/local/bin/lbctl
 mkdir -p /etc/lbmanager
 cp /var/lib/lbmanagerca/lbmanager.pem /etc/lbmanager/cert.pem
@@ -154,6 +161,13 @@ case "$PHASE"  in
    pre-start)
    ;;
    post-start)
+	   for bin in lbmanager lbctl; do
+		   if [ -f "$SCRIPT_DIR/$bin" ]; then
+			   # pct push can't be used here: the container's config is locked while the hookscript runs
+			   pct exec $VMID -- tee /usr/local/bin/$bin < "$SCRIPT_DIR/$bin" > /dev/null
+			   pct exec $VMID -- chmod 0755 /usr/local/bin/$bin
+		   fi
+	   done
 	   writeFile /install.sh
 	   pct exec $VMID /install.sh
    ;;
