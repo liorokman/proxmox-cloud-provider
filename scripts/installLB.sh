@@ -22,7 +22,7 @@ writeFile() {
 	ext_end=$(echo $ct_notes | jq -r .end)
 	ext_start=$(echo $ct_notes | jq -r .start)
 
-	pct exec $VMID tee $filename << EOF
+	pct exec $VMID tee $filename > /dev/null << EOF
 #!/bin/bash
 
 # Install the necessary tools, unless they are all there already

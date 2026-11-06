@@ -121,8 +121,8 @@ only set when a node registers, so existing nodes keep their old ones.
 ### P3: nice to have
 
 14. IPv6 and dual-stack. **M–L**
-15. A bootstrap script or Cluster API integration for the manual steps in the
-    README. **L**
+15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, one control
+    plane node). Cluster API integration is still open. **L**
 
 ### P25: maybe some day, but unlikely
 

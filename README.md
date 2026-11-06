@@ -90,6 +90,36 @@ using this cloud controller provider:
 
 # Creating a Kubernetes Cluster
 
+## Quick start: the bootstrap script
+
+`scripts/bootstrap-cluster.sh` does everything in the rest of this chapter on
+a Proxmox node: the SDN zone, VNet and subnet, the load balancer container, the
+cloud provider's API token, the control plane and worker VMs, `kubeadm`, the
+CNI (flannel) and the cloud provider. It takes about ten minutes.
+
+You need the [VM template](#prepare-a-vm-template-for-kubernetes-nodes) and the
+Proxmox setup above (a storage that allows snippets, and a spare range of LAN
+addresses). Run it as root on the Proxmox node, from a checkout of this
+repository:
+
+```bash
+cp scripts/cluster.env.example cluster.env     # edit it
+scripts/bootstrap-cluster.sh -c cluster.env up
+scripts/bootstrap-cluster.sh -c cluster.env status
+scripts/bootstrap-cluster.sh -c cluster.env destroy --yes
+```
+
+`up` can be repeated: every step skips what exists already, so a failed run
+resumes where it stopped. It writes the cluster's kubeconfig to
+`~/.kube/<CLUSTER_NAME>.yaml` (pointing at the API server's virtual IP). The
+Helm client is downloaded when the node has none. Every cluster gets its own
+Proxmox API token (`ccm-<CLUSTER_NAME>`), whose secret is kept in
+`/var/lib/pve-k8s-bootstrap`; the script never replaces a token that it didn't
+create. `destroy` deletes the VMs, the container, the VNet and that token.
+
+Limits: one control plane node, `/24` node subnets, and a VXLAN zone. The steps
+below are what the script does, if you want to do them by hand.
+
 ## Required Information
 
 1. Choose a range of VM IDs to be used for the Kubernetes
