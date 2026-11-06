@@ -85,35 +85,38 @@ Proxmox VE 9.2.
 2. Health checks, with weight 0 for failed destinations. **M**
 3. A resilient `Restore`, a mutex, and the small bugs: the nil dereference in
    `UpdateLoadBalancer` and the hard coded TCP protocol in `GetLoadBalancer`. **S**
-4. CI: build, vet, unit tests, the privileged IPVS test, and releases with
-   checksums and a signed image. **S–M**
 
 ### P1: much more useful for little work
 
-5. Node addresses from the QEMU guest agent, falling back to static cloud-init
+4. Node addresses from the QEMU guest agent, falling back to static cloud-init
    settings. Makes DHCP and IPAM based setups work. **S**
-6. Declarative `Apply` API. **M**
-7. Narrow RBAC in the chart instead of `cluster-admin`, and metrics: per-VIP
+5. Declarative `Apply` API. **M**
+6. Narrow RBAC in the chart instead of `cluster-admin`, and metrics: per-VIP
    connections and health from the IPVS statistics. **S**
-8. `externalTrafficPolicy: Local` through `healthCheckNodePort` (after 2). **S**
-9. Node labels: `topology.kubernetes.io/region` from the Proxmox cluster name,
+7. `externalTrafficPolicy: Local` through `healthCheckNodePort` (after 2). **S**
+8. Node labels: `topology.kubernetes.io/region` from the Proxmox cluster name,
    and an instance type derived from CPU and memory. **S**
-10. Hookscript: verify `SHA256SUMS`, skip `apt-get upgrade` when already
-    installed, and use a third NIC instead of the bridge. **S**
+9. Hookscript: verify `SHA256SUMS`, skip `apt-get upgrade` when already
+   installed, and use a third NIC instead of the bridge. **S**
 
 ### P2: bigger steps
 
-11. A highly available load balancer pair with keepalived and conntrackd. **L**
-12. A prebuilt load balancer appliance (template or OCI image). **M**
-13. Several clusters per load balancer container, one VNet each. **M**
-14. Hand the gateway role to SDN where the zone supports it (simple zone SNAT,
+10. A highly available load balancer pair with keepalived and conntrackd. **L**
+11. A prebuilt load balancer appliance (template or OCI image). **M**
+12. Several clusters per load balancer container, one VNet each. **M**
+13. Hand the gateway role to SDN where the zone supports it (simple zone SNAT,
     EVPN exit nodes). **M**
 
 ### P3: nice to have
 
-15. IPv6 and dual-stack. **M–L**
-16. A bootstrap script or Cluster API integration for the manual steps in the
+14. IPv6 and dual-stack. **M–L**
+15. A bootstrap script or Cluster API integration for the manual steps in the
     README. **L**
+
+### P25: maybe some day, but unlikely
+
+16. CI on GitHub: build, vet, unit tests, the privileged IPVS test, and
+    releases with checksums and a signed image. **S–M**
 17. An optional allocator backend that uses a real NetBox, which Proxmox can
     also use as the IPAM of the VNets. **M**
 
@@ -137,4 +140,4 @@ Proxmox IPAM was evaluated (on Proxmox VE 9.2) and does not fit the VIPs:
 
 The built-in allocator stays, and gets fixed (P0, item 1). A real NetBox
 shared by Proxmox and the project is the cleanest route if integration is ever
-wanted (P3, item 17).
+wanted (P25, item 17).
