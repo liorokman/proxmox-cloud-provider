@@ -10,6 +10,15 @@ Kubernetes nodes, and this project provides the glue required to add a load bala
 and allow Kubernetes to configure it when `LoadBalancer` services are created.
 
 
+# Tested versions
+
+| Component | Version |
+|---|---|
+| Proxmox VE | 9.2 |
+| Kubernetes | 1.37 |
+| Node and load balancer OS | Debian 13 (trixie) |
+| Go (to build) | 1.26 |
+
 # Proxmox Setup
 
 The following steps are required to prepare Proxmox for Kubernetes clusters
@@ -18,6 +27,16 @@ using this cloud controller provider:
 1. Enable the SDN functionality
    
    Full documentation is available [here](https://pve.proxmox.com/pve-docs/chapter-pvesdn.html).
+
+1. Load the IPVS kernel modules on every Proxmox node that can host the load balancer
+
+   The load balancer runs inside a container, which cannot load kernel modules
+   by itself. Load them on the host and make sure they are loaded after a reboot:
+
+   ```bash
+      printf 'ip_vs\nip_vs_rr\nnf_conntrack\n' > /etc/modules-load.d/ipvs.conf
+      modprobe -a ip_vs ip_vs_rr nf_conntrack
+   ```
 
 1. Install the `jq` utility on Proxmox
 
@@ -52,15 +71,21 @@ using this cloud controller provider:
 
 1. Prepare an API token for the Proxmox Cloud Provider
 
- > Note: The provided example command creates a very powerful API token, which is probably overkill. A future README will specify the exact privileges required.
+   The cloud provider only reads information about virtual machines, so it
+   needs a read-only role. The following creates a dedicated user, role and
+   token (with privilege separation turned off, so that the token inherits the
+   user's permissions):
 
    ```bash
-   pveum user token add root@pam ccm -privsep=0
+   pveum role add K8sCCM -privs "VM.Audit Sys.Audit"
+   pveum user add ccm@pve --comment "Kubernetes cloud controller"
+   pveum acl modify / --users ccm@pve --roles K8sCCM
+   pveum user token add ccm@pve ccm --privsep 0
    ```
  
-   Set `PROXMOX_API_TOKEN` to the generated token, and set `PROXMOX_API_USERNAME`
-   to the correct username. In this example, the username would be
-   `root@pam!ccm`
+   Set `PROXMOX_API_TOKEN` to the generated token value, and set
+   `PROXMOX_API_USERNAME` to the full token ID. In this example, the username
+   would be `ccm@pve!ccm`.
 
 # Creating a Kubernetes Cluster
 
@@ -78,6 +103,13 @@ using this cloud controller provider:
 
 1. Allocate an IP address in the main network bridge (`vmbr0`) for the
    Kubernetes API server. Called `$LB_EXT_IP` in this README.
+
+1. Choose the networks used by the cluster, and make sure that none of them overlap
+   with your LAN (the main network bridge) or with each other:
+
+   * The subnet of the Kubernetes nodes in the `k8s` VNet (for example `192.168.50.0/24`).
+   * The pod network CIDR (`--pod-network-cidr` for `kubeadm`, for example `10.244.0.0/16`).
+   * The service CIDR (`kubeadm` defaults to `10.96.0.0/12`).
 
 1. Find out the main network's CIDR and gateway. Respectivly `$EXT_CIDR` and
    `$EXT_GW`.
@@ -107,7 +139,12 @@ will be fixed in future versions of this project.
 
 1. Download the latest Debian template.
 
-   As of this writing, that template was version 12.0-1.
+   As of this writing, that template was version 13.6-1.
+
+   ```bash
+      pveam update
+      pveam download local debian-13-standard_13.6-1_amd64.tar.zst
+   ```
 
 1. Create the container
 
@@ -120,7 +157,7 @@ will be fixed in future versions of this project.
 
    ```bash
       DESCRIPTION="{\"ip\":\"$LB_EXT_IP\",\"mask\":24,\"start\":\"$LB_EXT_START\",\"end\":\"$LB_EXT_END\"}"
-      pct create 1100  local:vztmpl/debian-12-standard_12.0-1_amd64.tar.zst  \
+      pct create 1100  local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst  \
           -unprivileged 0 \
           -cores 2 -swap 0 -memory 512 -hostname k8slb1  \
           -net0 name=eth0,bridge=vmbr0,firewall=1,ip=$LB_EXT_IP/$EXT_CIDR,gw=$EXT_GW,type=veth \
@@ -132,7 +169,12 @@ will be fixed in future versions of this project.
 
 1. Copy the configuration hookscript `scripts/installLB.sh` to
    `$SNIPPET_STORAGE/snippets` on the Proxmox node where the load balancer
-   container was created.
+   container was created, and make it executable.
+
+   The script downloads the `lbmanager` and `lbctl` binaries from the GitHub
+   release set in the `LBMANAGER_VERSION` environment variable. To use binaries that you
+   built yourself instead, place `lbmanager` and `lbctl` in the same snippets
+   directory, next to the script. They take precedence over the download.
 
 1. Enable the hookscript for the load balancer container.
 
@@ -154,7 +196,12 @@ will be fixed in future versions of this project.
 Follow the instructions in [this](https://github.com/liorokman/packer-Debian#use-in-proxmox)
 Github repository to prepare a template that can be used for creating Kubernetes nodes.
 
-A pre-built image is available in the [releases](https://github.com/liorokman/proxmox-cloud-provider/releases/tag/v0.0.2) section of this project with `kubeadm`, `kubelet`, and `kubectl` versions 1.27.4 .
+The image is built from Debian 13 with `kubeadm`, `kubelet`, and `kubectl` version 1.37, and a
+containerd that is configured for the standard CNI plugin directory (`/opt/cni/bin`).
+
+> Note: When creating the template, use `-rng0 source=/dev/urandom` unless the Proxmox host
+> has a hardware random number generator. Virtual machines with `/dev/hwrng` will refuse to
+> start on hosts that do not have one.
 
 This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
 
@@ -226,7 +273,8 @@ Login as `debian` to the new Kubernetes master node, and move to `root` using `s
    Add any parameters required for your CNI of choice.
 
    ```bash
-   kubeadm init --control-plane-endpoint ${K8S_PUBLIC_APISERVER_DNSNAME}:6443 --upload-certs
+   kubeadm init --control-plane-endpoint ${K8S_PUBLIC_APISERVER_DNSNAME}:6443 \
+                --pod-network-cidr 10.244.0.0/16 --upload-certs
 
    # Install your choice of CNI
 
