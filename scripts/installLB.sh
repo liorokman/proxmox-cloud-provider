@@ -4,7 +4,7 @@ VMID=$1; shift
 PHASE=$1; shift
 
 # The release to download lbmanager and lbctl from, unless they are provided next to this script
-LBMANAGER_VERSION=${LBMANAGER_VERSION:-v0.0.2}
+LBMANAGER_VERSION=${LBMANAGER_VERSION:-v0.1.0}
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
 urldecode () { 
