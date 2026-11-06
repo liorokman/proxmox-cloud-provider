@@ -70,7 +70,10 @@ ip netns exec LB sysctl net.ipv4.ip_forward=1
 ip netns exec LB sysctl net.ipv4.vs.conntrack=1
 
 # 8. Setup SNAT so this container can serve as an internet gateway
-ip netns exec LB iptables -t nat -A POSTROUTING -m ipvs --destination \$ETH1_ADDR --vaddr $ext_ip  -j MASQUERADE
+# Connections from inside the VNet to a load balancer address must also have their source
+# rewritten. Otherwise the target answers the client directly, bypassing this container.
+ETH1_NET=\$(ip netns exec LB ip -j route show dev eth1 scope link | jq -r '.[0].dst')
+ip netns exec LB iptables -t nat -A POSTROUTING -s \$ETH1_NET -d \$ETH1_NET -m ipvs --ipvs -j MASQUERADE
 ip netns exec LB iptables -t nat -A POSTROUTING -o external0 -j SNAT --to-source $ext_ip
 
 # 9. Setup a CA for lbmanager
