@@ -2,8 +2,8 @@ package proxmox
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,8 +11,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/Telmate/proxmox-api-go/proxmox"
+	"github.com/luthermonson/go-proxmox"
 	v1 "k8s.io/api/core/v1"
 	cloudprovider "k8s.io/cloud-provider"
 )
@@ -33,26 +34,6 @@ type Instances struct {
 var _ cloudprovider.InstancesV2 = &Instances{}
 
 func newInstances(config ClusterConfig) (cloudprovider.InstancesV2, error) {
-	tls := &tls.Config{}
-	if config.InsecureTLS {
-		tls.InsecureSkipVerify = true
-	} else {
-		if config.CACert != "" {
-			capool := x509.NewCertPool()
-			data, err := os.ReadFile(config.CACert)
-			if err != nil {
-				return nil, err
-			}
-			if !capool.AppendCertsFromPEM(data) {
-				return nil, fmt.Errorf("Failed to load ca certificate")
-			}
-			tls.RootCAs = capool
-		}
-	}
-	c, err := proxmox.NewClient(config.URL, nil, "", tls, "", config.Timeout)
-	if err != nil {
-		return nil, err
-	}
 	username, err := os.ReadFile(config.Username)
 	if err != nil {
 		return nil, err
@@ -61,49 +42,65 @@ func newInstances(config ClusterConfig) (cloudprovider.InstancesV2, error) {
 	if err != nil {
 		return nil, err
 	}
-	proxmox.Debug = &config.Debug
-	c.SetAPIToken(strings.Trim(string(username), "\n\r \t"),
-		strings.Trim(string(apiToken), "\n\r \t"))
-	if _, err := c.GetVersion(); err != nil {
-		return nil, fmt.Errorf("bad username password: (%+v) %w", c, err)
+	opts := []proxmox.Option{
+		proxmox.WithAPIToken(strings.TrimSpace(string(username)), strings.TrimSpace(string(apiToken))),
+	}
+	if config.Timeout > 0 {
+		opts = append(opts, proxmox.WithTimeout(time.Duration(config.Timeout)*time.Second))
+	}
+	if config.InsecureTLS {
+		opts = append(opts, proxmox.WithInsecureSkipVerify())
+	} else if config.CACert != "" {
+		data, err := os.ReadFile(config.CACert)
+		if err != nil {
+			return nil, err
+		}
+		capool := x509.NewCertPool()
+		if !capool.AppendCertsFromPEM(data) {
+			return nil, fmt.Errorf("failed to load ca certificate")
+		}
+		opts = append(opts, proxmox.WithRootCAs(capool))
+	}
+	if config.Debug {
+		opts = append(opts, proxmox.WithLogger(&proxmox.LeveledLogger{Level: proxmox.LevelDebug}))
+	}
+	c := proxmox.NewClient(config.URL, opts...)
+	if _, err := c.Version(context.Background()); err != nil {
+		return nil, fmt.Errorf("failed to authenticate to proxmox at %s: %w", config.URL, err)
 	}
 	return &Instances{
 		client: c,
 	}, nil
-
 }
+
+// errVMNotFound is returned when no virtual machine matches a Kubernetes node
+var errVMNotFound = errors.New("virtual machine not found")
 
 // InstanceExists returns true if the instance for the given node exists according to the cloud provider.
 // Use the node.name or node.spec.providerID field to find the node in the cloud provider.
 func (i *Instances) InstanceExists(ctx context.Context, node *v1.Node) (bool, error) {
 	log.Printf("InstanceExists called for node %s ", node.Name)
-	vmRef, err := i.getVMRef(ctx, node)
-	if err != nil {
+	_, err := i.findVM(ctx, node)
+	if errors.Is(err, errVMNotFound) {
 		return false, nil
 	}
-	_, err = i.getVMInfo(vmRef)
-	if err != nil {
-		return false, nil
-	}
-	return true, nil
+	// Any other error (API unreachable, bad credentials, ...) must not be reported as
+	// "the VM is gone", since that causes the node object to be deleted from the cluster.
+	return err == nil, err
 }
 
 // InstanceShutdown returns true if the instance is shutdown according to the cloud provider.
 // Use the node.name or node.spec.providerID field to find the node in the cloud provider.
 func (i *Instances) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, error) {
 	log.Printf("InstanceShutdown called for node %s ", node.Name)
-	vmRef, err := i.getVMRef(ctx, node)
+	vm, err := i.findVM(ctx, node)
 	if err != nil {
 		return false, err
 	}
-	vmInfo, err := i.getVMInfo(vmRef)
-	if err != nil {
-		return false, err
+	if vm.Status == "" {
+		return false, fmt.Errorf("unexpected vm info - no status field returned for vm %d", uint64(vm.VMID))
 	}
-	if status, found := vmInfo["status"]; found {
-		return status != "running", nil
-	}
-	return false, fmt.Errorf("unexpected vm info - no status field returned: %+v", vmInfo)
+	return vm.Status != "running", nil
 }
 
 // InstanceMetadata returns the instance's metadata. The values returned in InstanceMetadata are
@@ -113,131 +110,119 @@ func (i *Instances) InstanceShutdown(ctx context.Context, node *v1.Node) (bool, 
 // properties of the node like its name, labels and annotations.
 func (i *Instances) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudprovider.InstanceMetadata, error) {
 	log.Printf("InstanceMetadata called for node %s ", node.Name)
-	vmRef, err := i.getVMRef(ctx, node)
+	vm, err := i.findVM(ctx, node)
 	if err != nil {
 		return nil, err
-	}
-	vmInfo, err := i.getVMInfo(vmRef)
-	if err != nil {
-		return nil, err
-	}
-
-	vmConfig, err := i.client.GetVmConfig(vmRef)
-	if err != nil {
-		return nil, err
-	}
-
-	var nodeName string
-	var vmType string
-	var found bool
-	if nodeName, found = vmInfo["node"].(string); !found {
-		log.Printf("info doesn't contain the node name")
-	}
-	if vmType, found = vmInfo["type"].(string); !found {
-		log.Printf("info doesn't contain the vm type")
 	}
 
 	retval := &cloudprovider.InstanceMetadata{
-		ProviderID:    getProviderID(vmInfo),
-		InstanceType:  vmType,
-		NodeAddresses: getAddresses(vmConfig),
-		Zone:          nodeName,
+		ProviderID:    getProviderID(vm),
+		InstanceType:  "qemu",
+		NodeAddresses: getAddresses(vm.VirtualMachineConfig),
+		Zone:          vm.Node,
 	}
 
 	log.Printf("Metadata returns %+v", retval)
 	return retval, nil
 }
 
-func getAddresses(config map[string]any) []v1.NodeAddress {
+func getAddresses(config *proxmox.VirtualMachineConfig) []v1.NodeAddress {
 	retval := []v1.NodeAddress{}
-	for k, v := range config {
-		if strings.HasPrefix(k, "ipconfig") {
-			// Sometimes there's an ipconfig? entry without a net? entry.
-			if _, found := config["net"+k[8:]]; !found {
-				continue
-			}
-			parts := strings.Split(v.(string), ",")
-			for _, currPart := range parts {
-				if before, after, found := strings.Cut(currPart, "="); found {
-					if before == "ip" {
-						ip, _, err := net.ParseCIDR(after)
-						if err != nil {
-							log.Printf("unexpected ip address %s: %s", currPart, err.Error())
-							continue
-						}
-						retval = append(retval, v1.NodeAddress{
-							Type:    v1.NodeInternalIP,
-							Address: ip.String(),
-						})
-						// already found the IP, no need to go on in this configuration key
-						break
-					}
-				}
-			}
-		} else if k == "name" {
-			retval = append(retval, v1.NodeAddress{
-				Type:    v1.NodeHostName,
-				Address: v.(string),
-			})
+	if config == nil {
+		return retval
+	}
+	for k, v := range config.IPConfigs {
+		// Sometimes there's an ipconfig? entry without a net? entry.
+		if _, found := config.Nets["net"+strings.TrimPrefix(k, "ipconfig")]; !found {
+			continue
 		}
+		for _, currPart := range strings.Split(v, ",") {
+			if before, after, found := strings.Cut(currPart, "="); found && before == "ip" {
+				ip, _, err := net.ParseCIDR(after)
+				if err != nil {
+					log.Printf("unexpected ip address %s: %s", currPart, err.Error())
+					continue
+				}
+				retval = append(retval, v1.NodeAddress{
+					Type:    v1.NodeInternalIP,
+					Address: ip.String(),
+				})
+				// already found the IP, no need to go on in this configuration key
+				break
+			}
+		}
+	}
+	if config.Name != "" {
+		retval = append(retval, v1.NodeAddress{
+			Type:    v1.NodeHostName,
+			Address: config.Name,
+		})
 	}
 	return retval
 }
 
-func getProviderID(info map[string]any) string {
-	// TODO: the current proxmox-go-api library doesn't provide an API to retrieve the cluster name. Ignore it for now.
-	nodeName := ""
-	vmid := 0.0
-	found := false
-	if nodeName, found = info["node"].(string); !found {
-		log.Printf("info doesn't contain the node name")
-	}
-	if vmid, found = info["vmid"].(float64); !found {
-		log.Printf("info doesn't contain the vmid")
-	}
-	return fmt.Sprintf("proxmox://%s/%s/%d", "", nodeName, int(vmid))
+func getProviderID(vm *proxmox.VirtualMachine) string {
+	// TODO: the cluster name is not retrieved, leave it empty for now.
+	return fmt.Sprintf("proxmox://%s/%s/%d", "", vm.Node, uint64(vm.VMID))
 }
 
-func (i *Instances) getVMRef(ctx context.Context, node *v1.Node) (*proxmox.VmRef, error) {
+// parseProviderID extracts the VM ID out of a providerID of the form proxmox:///<node>/<vmid>
+func parseProviderID(providerID string) (int, bool) {
+	if providerID == "" {
+		return 0, false
+	}
+	providerURL, err := url.Parse(providerID)
+	if err != nil {
+		log.Printf("ignoring invalid providerID: %s", providerID)
+		return 0, false
+	}
+	parts := strings.Split(providerURL.Path, "/")
+	// The expected format is "/node name/vm id"
+	if len(parts) != 3 {
+		log.Printf("ignoring invalid providerID: %s, path should be '<node>/<id>'", providerID)
+		return 0, false
+	}
+	id, err := strconv.Atoi(parts[2])
+	if err != nil {
+		log.Printf("ignoring invalid providerID: %s, id part is not numeric: %s", providerID, err.Error())
+		return 0, false
+	}
+	return id, true
+}
+
+// findVM locates the virtual machine backing a Kubernetes node, first by the providerID
+// and, failing that, by the node name. The returned VM includes its current status and configuration.
+func (i *Instances) findVM(ctx context.Context, node *v1.Node) (*proxmox.VirtualMachine, error) {
 	if i.client == nil {
 		return nil, fmt.Errorf("not connected to any proxmox cluster")
 	}
-	var vmRef *proxmox.VmRef
-	if node.Spec.ProviderID != "" {
-		if providerURL, err := url.Parse(node.Spec.ProviderID); err == nil {
-			parts := strings.Split(providerURL.Path, "/")
-			// The expected format is "/node name/vm id"
-			if len(parts) == 3 {
-				if id, err := strconv.Atoi(parts[2]); err == nil {
-					vmRef = proxmox.NewVmRef(id)
-				} else {
-					log.Printf("ignoring invalid providerID: %s, id part is not numeric: %s", node.Spec.ProviderID, err.Error())
-				}
-			} else {
-				log.Printf("ignoring invalid providerID: %s, path should be '<node>/<id>'", node.Spec.ProviderID)
-			}
-		} else {
-			log.Printf("ignoring invalid providerID: %s", node.Spec.ProviderID)
-		}
+	cluster, err := i.client.Cluster(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if vmRef == nil {
-		// Failed to identify the node using ProviderID, try using the node.name
-		var err error
-		vmRef, err = i.client.GetVmRefByName(node.Name)
-		if err != nil {
-			return nil, err
-		}
+	resources, err := cluster.Resources(ctx, "vm")
+	if err != nil {
+		return nil, err
 	}
-	return vmRef, nil
-}
 
-func (i *Instances) getVMInfo(vmRef *proxmox.VmRef) (map[string]any, error) {
-	if vmRef != nil {
-		vmInfo, err := i.client.GetVmInfo(vmRef)
-		if err != nil {
-			return nil, err
+	vmid, byID := parseProviderID(node.Spec.ProviderID)
+	var match *proxmox.ClusterResource
+	for _, r := range resources {
+		if r.Type != "qemu" || r.Template != 0 {
+			continue
 		}
-		return vmInfo, nil
+		if (byID && r.VMID == uint64(vmid)) || (!byID && r.Name == node.Name) {
+			match = r
+			break
+		}
 	}
-	return nil, fmt.Errorf("empty vmref provided")
+	if match == nil {
+		return nil, fmt.Errorf("%w: node %s (providerID %q)", errVMNotFound, node.Name, node.Spec.ProviderID)
+	}
+
+	pveNode, err := i.client.Node(ctx, match.Node)
+	if err != nil {
+		return nil, err
+	}
+	return pveNode.VirtualMachine(ctx, int(match.VMID))
 }

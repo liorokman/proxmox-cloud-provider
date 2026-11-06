@@ -31,6 +31,7 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/cloud-provider/app"
 	cloudcontrollerconfig "k8s.io/cloud-provider/app/config"
+	"k8s.io/cloud-provider/names"
 	"k8s.io/cloud-provider/options"
 	"k8s.io/component-base/cli"
 	cliflag "k8s.io/component-base/cli/flag"
@@ -73,7 +74,7 @@ func main() {
 		}
 	*/
 	fss := cliflag.NamedFlagSets{}
-	command := app.NewCloudControllerManagerCommand(ccmOptions, cloudInitializer, controllerInitializers, fss, wait.NeverStop)
+	command := app.NewCloudControllerManagerCommand(ccmOptions, cloudInitializer, controllerInitializers, names.CCMControllerAliases(), fss, wait.NeverStop)
 	code := cli.Run(command)
 	os.Exit(code)
 }
