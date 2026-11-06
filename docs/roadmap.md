@@ -78,7 +78,7 @@ Proxmox VE 9.2.
 
 ### P0: correctness
 
-**Done** on the main branch (not released yet); verified with unit tests, the
+**Done** on the main branch (released in v0.2.0); verified with unit tests, the
 privileged tests on the devstack host, and the devstack cluster.
 
 1. ~~Fix the built-in allocator~~ (done): recorded allocations, explicit addresses only
@@ -91,7 +91,7 @@ privileged tests on the devstack host, and the devstack cluster.
 
 ### P1: much more useful for little work
 
-**All of P1 is done** on the main branch (not released yet). The Helm chart's new cluster
+**All of P1 is done** on the main branch (released in v0.2.0). The Helm chart's new cluster
 role has a new name, so `helm upgrade` replaces the old `cluster-admin` binding.
 The cloud provider and `lbmanager` must be upgraded together (the new
 `Apply` call), and the Proxmox role needs `VM.GuestAgent.Audit`. The hookscript
