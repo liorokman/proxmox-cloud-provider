@@ -117,30 +117,32 @@ func (p *LoadBalancer) UpdateLoadBalancer(ctx context.Context, clusterName strin
 	return nil
 }
 
+// handleMappings reconciles the targets configured on the load balancer with the
+// service ports and the current set of nodes. It returns one PortStatus per service port.
 func (p *LoadBalancer) handleMappings(ctx context.Context, lbinfo *loadbalancer.LoadBalancerInformation, service *v1.Service, nodes []*v1.Node) []v1.PortStatus {
 
-	currentMappings := map[targetKey]int{}
+	// What is configured on the load balancer right now
+	currentMappings := map[targetKey]bool{}
 	for port, targetList := range lbinfo.Targets {
-		if targetList.Target != nil {
-			for i, v := range targetList.Target {
-				currentMappings[newTargetKey(v, port)] = i
-			}
+		for _, v := range targetList.GetTarget() {
+			currentMappings[newTargetKey(v, port)] = true
 		}
 	}
 	log.Printf("Current mappings: %+v", currentMappings)
+
+	// Add whatever is missing, and record everything that should be there. Anything
+	// configured that is not in the desired set is removed afterwards, once, for all ports.
+	desired := map[targetKey]bool{}
 	ports := []v1.PortStatus{}
 	for _, port := range service.Spec.Ports {
-		if toLBProtocol(port.Protocol) < 0 {
-			ports = append(ports, v1.PortStatus{
-				Port:     port.Port,
-				Protocol: port.Protocol,
-				Error:    asPtr(fmt.Sprintf("unsupported protocol: %s", port.Protocol)),
-			})
-			continue
+		stat := v1.PortStatus{
+			Port:     port.Port,
+			Protocol: port.Protocol,
 		}
-		atr := &loadbalancer.AddTargetRequest{
-			LbName:  lbinfo.Name,
-			SrcPort: port.Port,
+		if toLBProtocol(port.Protocol) < 0 {
+			stat.Error = asPtr(fmt.Sprintf("unsupported protocol: %s", port.Protocol))
+			ports = append(ports, stat)
+			continue
 		}
 		for _, currNode := range nodes {
 			nodeIP := ""
@@ -159,45 +161,41 @@ func (p *LoadBalancer) handleMappings(ctx context.Context, lbinfo *loadbalancer.
 				Protocol: toLBProtocol(port.Protocol),
 			}
 			currTargetKey := newTargetKey(target, port.Port)
-			if _, found := currentMappings[currTargetKey]; !found {
-				atr.Target = target
-				stat := v1.PortStatus{
-					Port:     port.Port,
-					Protocol: port.Protocol,
-				}
-				log.Printf("Adding a mapping for srcPort: %d %+v", port.Port, target)
-				code, err := p.client.AddTarget(ctx, atr)
-				log.Printf("err: %+v code: %+v", err, code)
-				if err != nil {
-					stat.Error = asPtr(err.Error())
-				} else if code.Code != loadbalancer.ErrSuccess {
-					stat.Error = asPtr(code.Message)
-				}
-				ports = append(ports, stat)
-			} else {
-				log.Printf("Mapping already exists for %+v", target)
-				ports = append(ports, v1.PortStatus{
-					Port:     port.Port,
-					Protocol: port.Protocol,
-				})
-				// Mark this protocol/ip/port combination as handled
-				delete(currentMappings, currTargetKey)
+			desired[currTargetKey] = true
+			if currentMappings[currTargetKey] {
+				continue
+			}
+			log.Printf("Adding a mapping for srcPort: %d %+v", port.Port, target)
+			code, err := p.client.AddTarget(ctx, &loadbalancer.AddTargetRequest{
+				LbName:  lbinfo.Name,
+				SrcPort: port.Port,
+				Target:  target,
+			})
+			if err != nil {
+				log.Printf("Failed to add mapping %s: %s", currTargetKey.String(), err)
+				stat.Error = asPtr(err.Error())
+			} else if code.Code != loadbalancer.ErrSuccess {
+				log.Printf("Failed to add mapping %s: (%d) %s", currTargetKey.String(), code.Code, code.Message)
+				stat.Error = asPtr(code.Message)
 			}
 		}
-		// Whatever is left in currentMappings should be removed
-		for k := range currentMappings {
-			log.Printf("removing mapping for %+v", k)
-			dtr := &loadbalancer.DelTargetRequest{
-				LbName:  lbinfo.Name,
-				SrcPort: k.SrcPort,
-				Target:  k.toTarget(),
-			}
-			code, err := p.client.DelTarget(ctx, dtr)
-			if err != nil {
-				log.Printf("Failed to remove unused mapping %s: %s", k.String(), err)
-			} else if code.Code != loadbalancer.ErrSuccess {
-				log.Printf("Failed to remove unused mapping %s: (%d) %s", k.String(), code.Code, code.Message)
-			}
+		ports = append(ports, stat)
+	}
+
+	for k := range currentMappings {
+		if desired[k] {
+			continue
+		}
+		log.Printf("removing mapping for %s", k.String())
+		code, err := p.client.DelTarget(ctx, &loadbalancer.DelTargetRequest{
+			LbName:  lbinfo.Name,
+			SrcPort: k.SrcPort,
+			Target:  k.toTarget(),
+		})
+		if err != nil {
+			log.Printf("Failed to remove unused mapping %s: %s", k.String(), err)
+		} else if code.Code != loadbalancer.ErrSuccess {
+			log.Printf("Failed to remove unused mapping %s: (%d) %s", k.String(), code.Code, code.Message)
 		}
 	}
 	log.Printf("finished handling mappings. Ports: %+v", ports)
