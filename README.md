@@ -181,7 +181,7 @@ section, plus a volume for the state (the CA and the database), then give it its
 settings and start the units:
 
 ```bash
-pct create 1100 local:vztmpl/lbmanager-v0.2.0_amd64.tar.zst -unprivileged 0 \
+pct create 1100 local:vztmpl/lbmanager-v0.3.0_amd64.tar.zst -unprivileged 0 \
     -hostname k8slb1 -memory 512 -features nesting=1 -rootfs $STORAGE:4 \
     -mp0 $STORAGE:1,mp=/var/lib/lbstate,backup=1 \
     -net0 name=eth0,bridge=vmbr0,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW \
@@ -444,7 +444,8 @@ the chart is upgraded. Load balancers and their state are kept in
 `/var/lib/lbmanager` in the container and survive the upgrade.
 
 1. Read the release notes for changes that need manual steps. For the changes
-   since v0.1.0 see "Notes for upgrading from v0.1.0" below.
+   since v0.2.0 see "Notes for upgrading from v0.2.0", and since v0.1.0 see
+   "Notes for upgrading from v0.1.0", below.
 
 1. Upgrade `lbmanager` and `lbctl`.
 
@@ -493,6 +494,25 @@ To roll back, put the previous binaries and hookscript back, reboot the
 container, and run `helm rollback proxmox-ccm`. Rolling back has not been
 tested across versions; back up `/var/lib/lbmanager` (or take a container
 snapshot with `pct snapshot`) before upgrading.
+
+## Notes for upgrading from v0.2.0
+
+v0.3.0 does not change the API between the cloud provider and `lbmanager`, so
+upgrading `lbmanager` first, as described above, is safe: a v0.2.0 cloud provider
+works with a v0.3.0 `lbmanager` (tested). The other way around is untested, but
+uses the same API. Nothing needs to be done by hand.
+
+* **IPVS library:** `lbmanager` uses `github.com/cloudflare/ipvs` instead of a
+  copy of `github.com/moby/ipvs`. Existing load balancers are re-created from
+  the database on start, as before.
+* **Appliance (optional):** see "The load balancer appliance". A hookscript
+  based container keeps working; you don't have to move to the appliance.
+* **Bootstrap script (optional):** `scripts/bootstrap-cluster.sh` builds a
+  whole cluster. It doesn't touch existing ones.
+* **Hookscript:** `installLB.sh` reads the container settings through the
+  Proxmox API (`pvesh`), so replace it together with the binaries.
+* **Fixed:** an unusable CA file used to give a nil credential without an error
+  in the cloud provider, `lbctl` and `lbmanager`.
 
 ## Notes for upgrading from v0.1.0
 
