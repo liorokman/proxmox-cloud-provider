@@ -124,6 +124,7 @@ fi
 : "${PVE_ROLE:=K8sCCM}"
 : "${CHART_DIR:=$REPO_DIR/chart}"
 : "${IMAGE_TAG:=}"                        # default: the chart's appVersion
+: "${IMAGE_ARCHIVE:=}"                    # optional: a docker/OCI image archive to load into every node (for an image that is not published yet)
 : "${HELM_VERSION:=v3.19.0}"              # downloaded if "helm" isn't installed
 : "${KUBECONFIG_OUT:=/root/.kube/$CLUSTER_NAME.yaml}"
 
@@ -435,6 +436,26 @@ step_kubeconfig() {
 	export KUBECONFIG=$KUBECONFIG_OUT
 }
 
+# Copy an image archive into the nodes' containerd. The nodes are only reachable
+# through the load balancer, so the Proxmox node gets a route through it.
+step_load_image() {
+	[ -n "$IMAGE_ARCHIVE" ] || return 0
+	log "Loading $IMAGE_ARCHIVE into the nodes"
+	[ -r "$IMAGE_ARCHIVE" ] || die "cannot read IMAGE_ARCHIVE=$IMAGE_ARCHIVE"
+	local key=${SSH_PUBLIC_KEY_FILE%.pub}
+	[ -r "$key" ] || die "copying the image needs the private key $key (next to SSH_PUBLIC_KEY_FILE)"
+	local ssh_opts=(-i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
+	ip route replace "$NODE_SUBNET" via "$LB_EXT_IP"
+	local i ip
+	for ((i = 0; i <= WORKERS; i++)); do
+		ip=$(node_ip "$i")
+		wait_for "ssh to $ip" 36 ssh "${ssh_opts[@]}" "debian@$ip" true
+		scp "${ssh_opts[@]}" -q "$IMAGE_ARCHIVE" "debian@$ip:/tmp/image.tar"
+		ssh "${ssh_opts[@]}" "debian@$ip" 'sudo ctr -n k8s.io images import /tmp/image.tar > /dev/null && rm -f /tmp/image.tar'
+		info "$(node_name "$i")"
+	done
+}
+
 ensure_helm() {
 	command -v helm > /dev/null && return 0
 	local dir=$STATE_DIR/helm-$HELM_VERSION
@@ -506,6 +527,7 @@ cmd_up() {
 	step_vms
 	step_control_plane
 	step_workers
+	step_load_image
 	step_kubeconfig
 	step_cloud_provider
 	step_wait
@@ -562,6 +584,7 @@ cmd_destroy() {
 		pveum user token remove "$PVE_USER" "$PVE_TOKEN_NAME" > /dev/null 2>&1 || true
 		rm -f "$STATE_DIR/$PVE_USER.$PVE_TOKEN_NAME.token"
 	fi
+	ip route del "$NODE_SUBNET" via "$LB_EXT_IP" 2> /dev/null || true
 	rm -f "$KUBECONFIG_OUT"
 	rm -rf "$CLUSTER_STATE"
 }
