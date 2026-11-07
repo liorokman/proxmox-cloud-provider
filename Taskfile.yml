@@ -1,0 +1,134 @@
+# Copyright 2026 Lior Okman
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# https://taskfile.dev: run `task` to list the tasks.
+version: "3"
+
+vars:
+  # The linters run through `go run`, so nothing has to be installed and they are
+  # built with the Go toolchain of this machine (a golangci-lint built with an older
+  # Go refuses to lint a newer module). Override on the command line:
+  #   task lint GOLANGCI_LINT_VERSION=v2.16.0
+  GOLANGCI_LINT_VERSION: v2.15.0
+  GOVULNCHECK_VERSION: v1.9.0
+  IMAGE: ghcr.io/liorokman/proxmox-cloud-provider
+  IMAGE_TAG: dev
+  BIN_DIR: bin
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the cloud provider, lbmanager and lbctl into ./bin
+    cmds:
+      - go build -trimpath -o {{.BIN_DIR}}/proxmox-cloud-controller-manager .
+      - go build -trimpath -o {{.BIN_DIR}}/lbmanager ./cmd/lbmanager
+      - go build -trimpath -o {{.BIN_DIR}}/lbctl ./cmd/lbctl
+    sources:
+      - "**/*.go"
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BIN_DIR}}/*"
+
+  image:
+    desc: Build the cloud provider's container image ({{.IMAGE}}:{{.IMAGE_TAG}})
+    cmds:
+      - docker build -t {{.IMAGE}}:{{.IMAGE_TAG}} .
+
+  proto:
+    desc: Regenerate the gRPC code from internal/loadbalancer/loadbalancer.proto (needs protoc, protoc-gen-go and protoc-gen-go-grpc)
+    cmds:
+      - protoc --go_out=. --go_opt=paths=source_relative --go-grpc_out=. --go-grpc_opt=paths=source_relative internal/loadbalancer/loadbalancer.proto
+
+  fmt:
+    desc: Format the Go code
+    cmds:
+      - gofmt -w -s $(git ls-files '*.go' | grep -v '\.pb\.go$')
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run the tests that don't need root (the IPVS ones skip themselves)
+    cmds:
+      - go test -count=1 ./...
+
+  test:race:
+    desc: Run the tests with the race detector
+    cmds:
+      - go test -count=1 -race ./...
+
+  test:privileged:
+    desc: "Also run every package as root on a Proxmox host over ssh: task test:privileged HOST=devstack"
+    requires:
+      vars: [HOST]
+    cmds:
+      - scripts/test-privileged.sh {{.HOST}}
+
+  cover:
+    desc: Run the tests and write the coverage profile to cover.out
+    cmds:
+      - go test -count=1 -coverprofile=cover.out ./...
+      - go tool cover -func=cover.out | tail -1
+
+  lint:
+    desc: Run golangci-lint {{.GOLANGCI_LINT_VERSION}} (configuration in .golangci.yml)
+    cmds:
+      - go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}} run ./...
+
+  vuln:
+    desc: Scan for known vulnerabilities with govulncheck {{.GOVULNCHECK_VERSION}}
+    cmds:
+      - go run golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}} ./...
+
+  helm:lint:
+    desc: Lint and render the Helm chart (with made-up values for the required ones)
+    vars:
+      VALUES: >-
+        --set lbmanager.hostname=lb.example
+        --set-string lbmanager.tls.key=k --set-string lbmanager.tls.cert=c --set-string lbmanager.tls.caCert=ca
+        --set-string proxmox.apiToken=t --set-string proxmox.user=u@pve!t --set-string proxmox.caCert=ca
+        --set proxmox.apiURL=https://pve.example:8006/api2/json
+    cmds:
+      - helm lint chart {{.VALUES}}
+      - helm template proxmox-ccm chart --namespace kube-system {{.VALUES}} > /dev/null
+
+  shell:check:
+    desc: Check the shell scripts (syntax, and shellcheck when it is installed)
+    cmds:
+      - for f in scripts/*.sh scripts/appliance/lb-network scripts/appliance/lb-prepare; do bash -n "$f"; done
+      - if command -v shellcheck > /dev/null; then shellcheck scripts/*.sh; else echo "shellcheck is not installed, skipped"; fi
+
+  check:
+    desc: Everything that should pass before a commit
+    cmds:
+      - task: vet
+      - task: test
+      - task: lint
+      - task: vuln
+      - task: helm:lint
+      - task: shell:check
+
+  clean:
+    desc: Remove build output
+    cmds:
+      - rm -rf {{.BIN_DIR}} cover.out
