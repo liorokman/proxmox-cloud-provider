@@ -76,6 +76,8 @@ fi
 # Proxmox
 : "${NODE:=$(hostname)}"
 : "${STORAGE:=local-lvm}"                 # VM and container disks
+: "${CP_STORAGE:=}"                       # control plane disks, if not on $STORAGE: a storage local to each node (fast: etcd needs low latency), see the README
+: "${CP_NODES:=}"                         # with CP_STORAGE: the Proxmox node of each control plane, in order (default: the nodes of the cluster, by name)
 : "${SNIPPET_STORAGE:=local}"             # must allow "snippets"
 : "${LAN_BRIDGE:=vmbr0}"
 : "${PVE_API_HOST:=}"                     # how the pods reach the Proxmox API (default: the address of $LAN_BRIDGE)
@@ -110,8 +112,11 @@ fi
 : "${K8S_TEMPLATE_ID:=}"                  # VM template with kubeadm, kubelet and containerd
 : "${CONTROL_PLANE_VMID:=1101}"
 : "${WORKER_VMID_START:=1102}"
+: "${CONTROL_PLANES:=1}"                  # 1, or more for stacked etcd members (see the README: 2 is worse than 1)
+: "${EXTRA_CP_VMID_START:=$((CONTROL_PLANE_VMID + 50))}"   # VM IDs of the control planes after the first
 : "${WORKERS:=1}"
 : "${NODE_IP_START:=3}"                   # last octet of the first node, the others follow
+: "${EXTRA_CP_IP_START:=$((NODE_IP_START + 50))}"          # last octet of the second control plane, the others follow
 : "${NODE_CORES:=2}"
 : "${NODE_MEMORY:=4096}"
 : "${NODE_DISK_GB:=20}"
@@ -171,10 +176,60 @@ same_subnet() { # ip1 ip2 bits
 	[ $(($(ip2int "$1") & mask)) -eq $(($(ip2int "$2") & mask)) ]
 }
 
-node_ip()   { echo "$SUBNET_PREFIX.$((NODE_IP_START + $1))"; }   # 0 = control plane, 1.. = workers
+# The nodes are numbered by slot: 0 is the first control plane, 1.. are the workers, and
+# 101.. are the other control planes (so that adding workers never renumbers them)
+node_ip() {
+	if [ "$1" -ge 100 ]; then echo "$SUBNET_PREFIX.$((EXTRA_CP_IP_START + $1 - 101))"; else echo "$SUBNET_PREFIX.$((NODE_IP_START + $1))"; fi
+}
 worker_id() { echo $((WORKER_VMID_START + $1 - 1)); }
-node_name() { if [ "$1" -eq 0 ]; then echo "$CLUSTER_NAME-cp1"; else echo "$CLUSTER_NAME-w$1"; fi; }
-node_vmid() { if [ "$1" -eq 0 ]; then echo "$CONTROL_PLANE_VMID"; else worker_id "$1"; fi; }
+node_name() {
+	if [ "$1" -ge 100 ]; then echo "$CLUSTER_NAME-cp$(($1 - 99))"
+	elif [ "$1" -eq 0 ]; then echo "$CLUSTER_NAME-cp1"
+	else echo "$CLUSTER_NAME-w$1"; fi
+}
+node_vmid() {
+	if [ "$1" -ge 100 ]; then echo $((EXTRA_CP_VMID_START + $1 - 101))
+	elif [ "$1" -eq 0 ]; then echo "$CONTROL_PLANE_VMID"
+	else worker_id "$1"; fi
+}
+extra_cp_slots() { local k; for ((k = 1; k < CONTROL_PLANES; k++)); do echo $((100 + k)); done; }
+worker_slots()   { local k; for ((k = 1; k <= WORKERS; k++)); do echo "$k"; done; }
+cp_slots()       { echo 0; extra_cp_slots; }
+node_slots()     { cp_slots; worker_slots; }   # in the order they are created
+
+# With CP_STORAGE the control planes have node local disks: one per node, not HA resources (etcd
+# keeps the state three times, and a control plane that is down waits for its node)
+cp_local() { [ -n "$CP_STORAGE" ] && [ "$CP_STORAGE" != "$STORAGE" ]; }
+is_cp() { [ "$1" -eq 0 ] || [ "$1" -ge 100 ]; }
+cp_node() { # slot -> the Proxmox node of that control plane
+	local n=$(($1 >= 100 ? $1 - 100 : 0)) nodes
+	nodes=${CP_NODES:-$(pve get /nodes | jq -r '[.[].node] | sort | join(" ")')}
+	# shellcheck disable=SC2206
+	nodes=($nodes)
+	[ "${#nodes[@]}" -gt 0 ] || die "no Proxmox nodes for the control planes"
+	echo "${nodes[$((n % ${#nodes[@]}))]}"
+}
+
+# qm and pct only see the guests of the host they run on, but with HA the guests
+# move between the hosts. These wrappers run the command on the host that owns
+# the guest (the first number among the arguments), over the SSH trust that
+# Proxmox sets up between the nodes of a cluster.
+guest_node() { pvesh get /cluster/resources --type vm --output-format json 2> /dev/null | jq -r --argjson id "$1" '.[] | select(.vmid == $id) | .node'; }
+on_owner() { # tool args...
+	local tool=$1; shift
+	local a id='' node=''
+	for a in "$@"; do
+		if [[ $a =~ ^[0-9]+$ ]]; then id=$a; break; fi
+	done
+	[ -z "$id" ] || node=$(guest_node "$id")
+	if [ -z "$node" ] || [ "$node" = "$NODE" ]; then command "$tool" "$@"; return; fi
+	# By address: the node names don't have to resolve
+	local addr
+	addr=$(pvesh get /cluster/status --output-format json 2> /dev/null | jq -r --arg n "$node" '.[] | select(.type == "node" and .name == $n) | .ip')
+	ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR "root@${addr:-$node}" "LC_ALL=C $(printf '%q ' "$tool" "$@")"
+}
+qm()  { on_owner qm "$@"; }
+pct() { on_owner pct "$@"; }
 
 vm_exists() { qm status "$1" > /dev/null 2>&1; }
 ct_exists() { pct status "$1" > /dev/null 2>&1; }
@@ -233,12 +288,25 @@ preflight() {
 		same_subnet "$LB_EXT_IP" "$a" "$LAN_CIDR_BITS" || die "$a is not in the same /$LAN_CIDR_BITS network as LB_EXT_IP $LB_EXT_IP"
 	done
 	info "node $NODE, template $K8S_TEMPLATE_ID, API server $API_VIP:6443"
-
-	# The IPVS kernel modules have to be loaded on the host
-	if [ ! -f /etc/modules-load.d/ipvs.conf ]; then
-		printf 'ip_vs\nip_vs_rr\nnf_conntrack\n' > /etc/modules-load.d/ipvs.conf
+	[ "$CONTROL_PLANES" -ge 1 ] || die "CONTROL_PLANES must be 1 or more"
+	if [ $((CONTROL_PLANES % 2)) -eq 0 ]; then
+		info "WARNING: $CONTROL_PLANES etcd members tolerate no more failed members than $((CONTROL_PLANES - 1)) would, and there is more that can fail: use an odd number of control planes"
 	fi
-	modprobe -a ip_vs ip_vs_rr nf_conntrack
+
+	# The IPVS kernel modules have to be loaded on the host. The container may
+	# run on any node of a cluster (HA moves it), so on every one of them
+	local ipvs_setup="printf 'ip_vs\nip_vs_rr\nnf_conntrack\n' > /etc/modules-load.d/ipvs.conf; modprobe -a ip_vs ip_vs_rr nf_conntrack"
+	local n addr
+	for n in $(pve get /nodes | jq -r '.[].node'); do
+		if [ "$n" = "$NODE" ]; then
+			bash -c "$ipvs_setup"
+			continue
+		fi
+		addr=$(pve get /cluster/status | jq -r --arg n "$n" '.[] | select(.type == "node" and .name == $n) | .ip')
+		ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR "root@${addr:-$n}" "$ipvs_setup" \
+			|| die "cannot load the IPVS modules on node $n"
+		info "IPVS modules loaded on node $n"
+	done
 	mkdir -p "$CLUSTER_STATE"; chmod 700 "$STATE_DIR" "$CLUSTER_STATE"
 }
 
@@ -251,6 +319,17 @@ step_sdn() {
 		[ -n "$peers" ] || peers=$PVE_API_HOST
 		pvesh create /cluster/sdn/zones --type vxlan --zone "$ZONE" --peers "$peers" --ipam pve > /dev/null
 		info "created VXLAN zone $ZONE (peers $peers)"; changed=1
+	else
+		# A node that joined the Proxmox cluster after the zone was created has no VNet bridge,
+		# so guests can't be started or migrated there: add the nodes that are missing
+		local have want missing
+		have=$(pve get "/cluster/sdn/zones/$ZONE" | jq -r '.peers // ""')
+		want=$(pve get /cluster/status | jq -r '.[] | select(.type == "node") | .ip')
+		missing=$(for a in $want; do grep -qw -- "$a" <<< "${have//,/ }" || echo "$a"; done | paste -sd,)
+		if [ -n "$missing" ]; then
+			pvesh set "/cluster/sdn/zones/$ZONE" --peers "${have:+$have,}$missing" > /dev/null
+			info "added the nodes $missing to the peers of the VXLAN zone $ZONE"; changed=1
+		fi
 	fi
 	if ! pve get /cluster/sdn/vnets | jq -e --arg v "$VNET" '.[] | select(.vnet == $v)' > /dev/null; then
 		pvesh create /cluster/sdn/vnets --vnet "$VNET" --zone "$ZONE" --tag "$VNET_TAG" > /dev/null
@@ -386,20 +465,34 @@ step_credentials() {
 step_vms() {
 	log "Virtual machines"
 	local i id name ip
-	for ((i = 0; i <= WORKERS; i++)); do
+	for i in $(node_slots); do
 		id=$(node_vmid "$i"); name=$(node_name "$i"); ip=$(node_ip "$i")
 		if ! vm_exists "$id"; then
-			qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
+			if is_cp "$i" && cp_local; then
+				# The template is on shared storage, so the clone can be made on another node
+				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --target "$(cp_node "$i")" --pool "$POOL" > /dev/null
+			else
+				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
+			fi
 			qm set "$id" --cores "$NODE_CORES" --memory "$NODE_MEMORY" --agent enabled=1 \
 				--net0 "virtio,bridge=$VNET" --ipconfig0 "ip=$ip/24,gw=$GATEWAY_IP" \
 				--nameserver "$DNS_SERVER" --sshkeys "$SSH_PUBLIC_KEY_FILE" --onboot 1 --tags "$TAGS" > /dev/null
-			qm disk resize "$id" virtio0 "${NODE_DISK_GB}G" > /dev/null
+			# On slow storage (NFS) the resize may time out although it finished on the disk,
+			# without the new size reaching the VM's configuration: rescan, then check
+			qm disk resize "$id" virtio0 "${NODE_DISK_GB}G" > /dev/null || true
+			qm rescan --vmid "$id" > /dev/null
+			qm config "$id" | grep '^virtio0:' | grep -q "size=${NODE_DISK_GB}G" \
+				|| die "the disk of $name is not ${NODE_DISK_GB}G: check the storage $STORAGE and run 'qm resize $id virtio0 ${NODE_DISK_GB}G'"
 			qm cloudinit update "$id"
 			info "created $name ($id) at $ip"
 		fi
+		# A run that was interrupted between the clone and the configuration leaves a VM that
+		# still has the template's settings
+		qm config "$id" | grep -q "^net0:.*bridge=$VNET\b" \
+			|| die "VM $id ($name) exists but isn't configured for this cluster (an interrupted run?): delete it with 'qm destroy $id --purge 1' and run this again"
 		if [ "$(qm status "$id" | awk '{print $2}')" != running ]; then qm start "$id"; fi
 	done
-	for ((i = 0; i <= WORKERS; i++)); do
+	for i in $(node_slots); do
 		wait_for "the guest agent of $(node_name "$i")" 60 qm agent "$(node_vmid "$i")" ping
 	done
 }
@@ -408,7 +501,7 @@ step_vms() {
 step_pool() {
 	local members id i
 	members=$(pve get "/pools/$POOL" | jq -r '.members[]?.vmid' 2> /dev/null || true)
-	for id in "$LB_VMID" $(for ((i = 0; i <= WORKERS; i++)); do node_vmid "$i"; done); do
+	for id in "$LB_VMID" $(for i in $(node_slots); do node_vmid "$i"; done); do
 		grep -qx "$id" <<< "$members" && continue
 		pvesh set "/pools/$POOL" --vms "$id" > /dev/null
 		info "added $id to the pool"
@@ -416,8 +509,14 @@ step_pool() {
 }
 
 # HA resources, and rules that keep the load balancer away from the control plane, and the
-# workers away from each other (when there are hosts enough for that). Proxmox does
-# the placing, and the HA manager may migrate the VMs: the cloud provider updates the node labels.
+# workers away from each other. Proxmox does the placing, and the HA manager may migrate the
+# VMs: the cloud provider updates the node labels.
+#
+# The rules are strict: when a node fails, the HA manager won't recover a guest onto a node
+# that holds a guest it must be kept away from, and then it doesn't recover it at all ("no
+# recovery node found") until the node is back. So a rule is created only when its guests
+# still fit on the nodes that are left after any one node fails (the group has at most
+# nodes - 1 guests). On 2 nodes that means no rules: recovery matters more than spreading.
 step_ha() {
 	[ "$HA" = yes ] || return 0
 	log "High availability"
@@ -425,19 +524,53 @@ step_ha() {
 	nodes=$(pve get /nodes | jq 'length')
 	[ "$nodes" -ge 2 ] || { info "HA=yes needs a Proxmox cluster of 2 nodes or more, skipping"; return 0; }
 	pve get /cluster/ha/resources > /dev/null || die "cannot read the HA resources (is this node in a cluster?)"
-	for id in "vm:$(node_vmid 0)" $(for ((i = 1; i <= WORKERS; i++)); do echo "vm:$(node_vmid "$i")"; done) "ct:$LB_VMID"; do
+	for id in $(for i in $(if cp_local; then worker_slots; else node_slots; fi); do echo "vm:$(node_vmid "$i")"; done) "ct:$LB_VMID"; do
 		pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null \
 			|| { pvesh create /cluster/ha/resources --sid "$id" --state started > /dev/null; info "HA resource $id"; }
 	done
-	ha_rule "ha-$CLUSTER_NAME-lb" "ct:$LB_VMID,vm:$(node_vmid 0)"
-	if [ "$WORKERS" -ge 2 ] && [ "$WORKERS" -le "$nodes" ]; then
-		ha_rule "ha-$CLUSTER_NAME-workers" "$(for ((i = 1; i <= WORKERS; i++)); do printf 'vm:%s,' "$(node_vmid "$i")"; done | sed 's/,$//')"
+	if cp_local; then
+		info "the control planes are not HA resources (CP_STORAGE=$CP_STORAGE): etcd keeps their state, and each waits for its node"
+		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-cp"; do
+			pve get /cluster/ha/rules | jq -e --arg r "$r" '.[] | select(.rule == $r)' > /dev/null && pvesh delete "/cluster/ha/rules/$r" > /dev/null
+		done
+	elif [ "$nodes" -ge 3 ]; then
+		ha_rule "ha-$CLUSTER_NAME-lb" "ct:$LB_VMID,vm:$(node_vmid 0)"
+	else
+		info "no anti-affinity rule for the load balancer: after a node failure it would have no node left (needs 3 nodes)"
+	fi
+	if [ "$WORKERS" -ge 2 ]; then
+		if [ "$WORKERS" -le $((nodes - 1)) ]; then
+			ha_rule "ha-$CLUSTER_NAME-workers" "$(for ((i = 1; i <= WORKERS; i++)); do printf 'vm:%s,' "$(node_vmid "$i")"; done | sed 's/,$//')"
+		else
+			info "no anti-affinity rule for the workers: $WORKERS workers wouldn't fit on the $((nodes - 1)) nodes left after a node failure"
+		fi
+	fi
+	# The control planes are the exception to "must fit on the nodes that remain": one on
+	# each node keeps a majority of the etcd members through any single node failure, so the
+	# API server stays up even though the HA manager won't restart the lost one elsewhere
+	# before its node is back. With 2 there is no majority to keep, so no rule.
+	if [ "$CONTROL_PLANES" -ge 3 ] && ! cp_local; then
+		if [ "$CONTROL_PLANES" -le "$nodes" ]; then
+			ha_rule "ha-$CLUSTER_NAME-cp" "$(for i in $(cp_slots); do printf 'vm:%s,' "$(node_vmid "$i")"; done | sed 's/,$//')"
+		else
+			info "no anti-affinity rule for the control planes: $CONTROL_PLANES control planes don't fit on $nodes nodes"
+		fi
 	fi
 }
 
-ha_rule() { # name resources: keep the resources on different hosts
-	pve get /cluster/ha/rules | jq -e --arg r "$1" '.[] | select(.rule == $r)' > /dev/null \
-		|| { pvesh create /cluster/ha/rules --rule "$1" --type resource-affinity --affinity negative --resources "$2" > /dev/null; info "HA rule $1"; }
+ha_rule() { # name resources: keep the resources on different hosts. Updates the members of an existing rule
+	local current want
+	current=$(pve get /cluster/ha/rules | jq -r --arg r "$1" '.[] | select(.rule == $r) | .resources')
+	if [ -z "$current" ]; then
+		pvesh create /cluster/ha/rules --rule "$1" --type resource-affinity --affinity negative --resources "$2" > /dev/null
+		info "HA rule $1"
+		return
+	fi
+	want=$(tr ',' '\n' <<< "$2" | sort | paste -sd,)
+	if [ "$(tr ',' '\n' <<< "$current" | sort | paste -sd,)" != "$want" ]; then
+		pvesh set "/cluster/ha/rules/$1" --type resource-affinity --resources "$2" > /dev/null
+		info "HA rule $1 now covers $2"
+	fi
 }
 
 prepare_kubelet() { # vmid
@@ -464,6 +597,24 @@ step_control_plane() {
 		info "installing the CNI"
 		vm_exec "$id" "kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f $CNI_MANIFEST" > /dev/null
 	fi
+	local i name ip2 id2 cmd key
+	for i in $(extra_cp_slots); do
+		id2=$(node_vmid "$i"); name=$(node_name "$i"); ip2=$(node_ip "$i")
+		if ! lbctl -op list | grep 'name:"apiserver"' | grep -q "dstIP:\"$ip2\""; then
+			lbctl -op addTgt -name apiserver -srv "$ip2" -sport 6443 -dport 6443 > /dev/null
+			info "API server target $ip2:6443"
+		fi
+		if vm_exec "$id2" 'test -f /etc/kubernetes/kubelet.conf' > /dev/null 2>&1; then
+			info "$name already joined"; continue
+		fi
+		prepare_kubelet "$id2"
+		# The certificates of the control plane are shared through a Secret that expires after 2 hours
+		key=$(vm_exec "$id" 'kubeadm init phase upload-certs --upload-certs 2> /dev/null' | tail -1)
+		cmd=$(vm_exec "$id" 'kubeadm token create --ttl 1h --print-join-command' | grep '^kubeadm join' | tail -1)
+		[ -n "$key" ] && [ -n "$cmd" ] || die "could not get the control plane join command from $(node_name 0)"
+		info "$name: kubeadm join --control-plane (a few minutes)"
+		vm_exec "$id2" "$cmd --control-plane --certificate-key $key > /var/log/kubeadm-join.log 2>&1 || { tail -30 /var/log/kubeadm-join.log; exit 1; }"
+	done
 }
 
 step_workers() {
@@ -501,7 +652,7 @@ step_load_image() {
 	local ssh_opts=(-i "$key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10)
 	ip route replace "$NODE_SUBNET" via "$LB_EXT_IP"
 	local i ip
-	for ((i = 0; i <= WORKERS; i++)); do
+	for i in $(node_slots); do
 		ip=$(node_ip "$i")
 		wait_for "ssh to $ip" 36 ssh "${ssh_opts[@]}" "debian@$ip" true
 		scp "${ssh_opts[@]}" -q "$IMAGE_ARCHIVE" "debian@$ip:/tmp/image.tar"
@@ -552,7 +703,7 @@ step_cloud_provider() {
 
 step_wait() {
 	log "Waiting for the nodes"
-	local want=$((WORKERS + 1))
+	local want=$((WORKERS + CONTROL_PLANES))
 	wait_ready "$want"
 	kc get nodes -o wide
 }
@@ -581,13 +732,15 @@ cmd_up() {
 	step_credentials
 	step_vms
 	step_pool
-	step_ha
 	step_control_plane
 	step_workers
 	step_load_image
 	step_kubeconfig
 	step_cloud_provider
 	step_wait
+	# Last, so that the HA manager only starts moving the guests (to satisfy the
+	# rules) once the cluster is up and the cloud provider keeps the labels right
+	step_ha
 	log "Done"
 	cat <<EOF
     export KUBECONFIG=$KUBECONFIG_OUT
@@ -604,7 +757,7 @@ cmd_status() {
 	local i
 	printf '%-20s %s\n' "SDN VNet $VNET" "$(ip link show "$VNET" > /dev/null 2>&1 && echo present || echo missing)"
 	printf '%-20s %s\n' "container $LB_VMID" "$(pct status "$LB_VMID" 2> /dev/null || echo missing)"
-	for ((i = 0; i <= WORKERS; i++)); do
+	for i in $(node_slots); do
 		printf '%-20s %s\n' "$(node_name "$i") ($(node_vmid "$i"))" "$(qm status "$(node_vmid "$i")" 2> /dev/null || echo missing)"
 	done
 	kc get nodes 2> /dev/null || true
@@ -617,14 +770,14 @@ cmd_destroy() {
 	local i id
 	# HA resources first: the HA manager would start the guests again
 	if pve get /cluster/ha/rules 2> /dev/null | jq -e '.' > /dev/null 2>&1; then
-		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-workers"; do
+		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-workers" "ha-$CLUSTER_NAME-cp"; do
 			pve get /cluster/ha/rules | jq -e --arg r "$r" '.[] | select(.rule == $r)' > /dev/null && pvesh delete "/cluster/ha/rules/$r" > /dev/null
 		done
-		for id in "ct:$LB_VMID" $(for ((i = 0; i <= WORKERS; i++)); do echo "vm:$(node_vmid "$i")"; done); do
+		for id in "ct:$LB_VMID" $(for i in $(node_slots); do echo "vm:$(node_vmid "$i")"; done); do
 			pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null && pvesh delete "/cluster/ha/resources/$id" > /dev/null
 		done
 	fi
-	for ((i = WORKERS; i >= 0; i--)); do
+	for i in $(node_slots | tac); do
 		id=$(node_vmid "$i")
 		if vm_exists "$id"; then
 			qm stop "$id" --skiplock 1 > /dev/null 2>&1 || true
