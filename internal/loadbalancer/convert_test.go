@@ -85,25 +85,26 @@ func TestErrText(t *testing.T) {
 
 func TestReadHealthConfig(t *testing.T) {
 	cfg := readHealthConfig(koanf.New("."))
-	if !cfg.enabled || cfg.interval != defaultHealthInterval || cfg.timeout != defaultHealthTimeout ||
+	if !cfg.enabled || cfg.interval != defaultHealthInterval || cfg.downInterval != defaultHealthDownInterval || cfg.timeout != defaultHealthTimeout ||
 		cfg.fall != defaultHealthFall || cfg.rise != defaultHealthRise {
 		t.Errorf("defaults: %+v", cfg)
 	}
 
 	k := koanf.New(".")
 	for key, v := range map[string]any{
-		"loadbalancer.healthCheck.enabled":  false,
-		"loadbalancer.healthCheck.interval": "250ms",
-		"loadbalancer.healthCheck.timeout":  "2s",
-		"loadbalancer.healthCheck.fall":     5,
-		"loadbalancer.healthCheck.rise":     4,
+		"loadbalancer.healthCheck.enabled":      false,
+		"loadbalancer.healthCheck.interval":     "250ms",
+		"loadbalancer.healthCheck.downInterval": "75ms",
+		"loadbalancer.healthCheck.timeout":      "2s",
+		"loadbalancer.healthCheck.fall":         5,
+		"loadbalancer.healthCheck.rise":         4,
 	} {
 		if err := k.Set(key, v); err != nil {
 			t.Fatal(err)
 		}
 	}
 	cfg = readHealthConfig(k)
-	if cfg.enabled || cfg.interval != 250*time.Millisecond || cfg.timeout != 2*time.Second || cfg.fall != 5 || cfg.rise != 4 {
+	if cfg.enabled || cfg.interval != 250*time.Millisecond || cfg.downInterval != 75*time.Millisecond || cfg.timeout != 2*time.Second || cfg.fall != 5 || cfg.rise != 4 {
 		t.Errorf("overrides: %+v", cfg)
 	}
 

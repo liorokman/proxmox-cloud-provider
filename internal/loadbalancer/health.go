@@ -43,18 +43,23 @@ import (
 
 const (
 	defaultHealthInterval = 5 * time.Second
-	defaultHealthTimeout  = time.Second
-	defaultHealthFall     = 3
-	defaultHealthRise     = 2
-	probeWorkers          = 8
+	// Targets that are down are probed this often, so that a new Service (whose
+	// NodePort kube-proxy may not have opened yet) or a recovered node is
+	// brought in quickly instead of after rise * interval
+	defaultHealthDownInterval = time.Second
+	defaultHealthTimeout      = time.Second
+	defaultHealthFall         = 3
+	defaultHealthRise         = 2
+	probeWorkers              = 8
 )
 
 type healthConfig struct {
-	enabled  bool
-	interval time.Duration
-	timeout  time.Duration
-	fall     int // consecutive failures before a target is taken out
-	rise     int // consecutive successes before it comes back
+	enabled      bool
+	interval     time.Duration
+	downInterval time.Duration // between probes while some target is down
+	timeout      time.Duration
+	fall         int // consecutive failures before a target is taken out
+	rise         int // consecutive successes before it comes back
 }
 
 type healthState struct {
@@ -208,24 +213,29 @@ func (p *tcpProber) probe(t *Target) bool {
 	return <-res
 }
 
-// runHealthChecks probes all the targets every interval until ctx is done.
+// runHealthChecks probes all the targets every interval until ctx is done, or
+// every downInterval while any target is down.
 func (l *loadBalancerServer) runHealthChecks(ctx context.Context) {
-	ticker := time.NewTicker(l.healthCfg.interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
-		l.checkHealthOnce()
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		case <-l.kick:
 		}
+		next := l.healthCfg.interval
+		if l.checkHealthOnce() && l.healthCfg.downInterval < next {
+			next = l.healthCfg.downInterval
+		}
+		timer.Reset(next)
 	}
 }
 
 // checkHealthOnce probes every TCP target once and updates the IPVS weights of
-// those whose state changed.
-func (l *loadBalancerServer) checkHealthOnce() {
+// those whose state changed. It reports whether any target is down now.
+func (l *loadBalancerServer) checkHealthOnce() (anyDown bool) {
 	// Snapshot the targets, so the probes run without holding the lock
 	l.mu.Lock()
 	toProbe := map[string]*Target{}
@@ -291,6 +301,12 @@ func (l *loadBalancerServer) checkHealthOnce() {
 			log.Printf("health: target %s is down", k)
 		}
 	}
+	for k := range keep {
+		if !l.health.isHealthy(k) {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *loadBalancerServer) setWeight(lb *LoadBalancerInformation, port int32, t *Target) error {

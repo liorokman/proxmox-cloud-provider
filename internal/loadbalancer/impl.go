@@ -180,17 +180,21 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 
 func readHealthConfig(config *koanf.Koanf) healthConfig {
 	cfg := healthConfig{
-		enabled:  true,
-		interval: defaultHealthInterval,
-		timeout:  defaultHealthTimeout,
-		fall:     defaultHealthFall,
-		rise:     defaultHealthRise,
+		enabled:      true,
+		interval:     defaultHealthInterval,
+		downInterval: defaultHealthDownInterval,
+		timeout:      defaultHealthTimeout,
+		fall:         defaultHealthFall,
+		rise:         defaultHealthRise,
 	}
 	if config.Exists("loadbalancer.healthCheck.enabled") {
 		cfg.enabled = config.Bool("loadbalancer.healthCheck.enabled")
 	}
 	if d := config.Duration("loadbalancer.healthCheck.interval"); d > 0 {
 		cfg.interval = d
+	}
+	if d := config.Duration("loadbalancer.healthCheck.downInterval"); d > 0 {
+		cfg.downInterval = d
 	}
 	if d := config.Duration("loadbalancer.healthCheck.timeout"); d > 0 {
 		cfg.timeout = d

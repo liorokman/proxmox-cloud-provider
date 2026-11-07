@@ -150,8 +150,8 @@ Implementation notes for P0:
   protocol (`ErrPortConflict`). The address leaves the interface only with its
   last holder.
 * Health checks are TCP connects from inside the `LB` namespace
-  (`loadbalancer.healthCheck`: `enabled`, `interval` 5s, `timeout` 1s, `fall` 3,
-  `rise` 2). UDP targets are not checked.
+  (`loadbalancer.healthCheck`: `enabled`, `interval` 5s, `downInterval` 1s,
+  `timeout` 1s, `fall` 3, `rise` 2). UDP targets are not checked.
 * Restoring after a restart of `lbmanager` is idempotent: IPVS entries that
   survived are updated instead of failing. Before, any such restart ended in
   `log.Fatalf`.

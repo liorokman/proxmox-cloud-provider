@@ -72,7 +72,9 @@ Services can share a VIP on different ports.
 `lbmanager` probes every TCP target with a TCP connect from inside the `LB`
 namespace. A target that fails `fall` probes in a row gets IPVS weight 0 (no
 new connections, existing ones continue), and gets weight 1 again after `rise`
-successful probes.
+successful probes. Targets that are down are probed again every second
+(`downInterval`), not every `interval`, so a new Service whose NodePort kube-proxy
+has not opened yet is brought in within a few seconds.
 
 `EnsureLoadBalancer` and `UpdateLoadBalancer` compute the complete set of
 wanted targets over all ports and nodes and send it to `lbmanager` in one

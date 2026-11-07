@@ -511,6 +511,10 @@ uses the same API. Nothing needs to be done by hand.
   whole cluster. It doesn't touch existing ones.
 * **Hookscript:** `installLB.sh` reads the container settings through the
   Proxmox API (`pvesh`), so replace it together with the binaries.
+* **Fixed:** a new `LoadBalancer` Service used to refuse connections for about
+  7 seconds, because its targets were probed before kube-proxy opened the
+  NodePort and then needed two probes five seconds apart to come back. Targets
+  that are down are now probed every second (`loadbalancer.healthCheck.downInterval`).
 * **Fixed:** an unusable CA file used to give a nil credential without an error
   in the cloud provider, `lbctl` and `lbmanager`.
 

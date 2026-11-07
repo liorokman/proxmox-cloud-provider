@@ -367,3 +367,59 @@ func TestNewServerRejectsBadConfiguration(t *testing.T) {
 		}
 	}
 }
+
+// A new Service is probed before kube-proxy has opened its NodePort. The target
+// then starts out down, and must come up soon after the port opens even though
+// the normal interval is long.
+func TestNewTargetComesUpQuicklyAfterItsPortOpens(t *testing.T) {
+	k := testConfig(t,
+		"  healthCheck:",
+		"    interval: 30s",
+		"    downInterval: 50ms",
+		"    timeout: 200ms",
+		"    fall: 2",
+		"    rise: 2")
+	ns := k.String("loadbalancer.namespace")
+	nstest.AddAddr(t, ns, "10.9.9.1/24")
+
+	// A port that nobody listens on yet
+	l := listenIn(t, ns, "10.9.9.1:0")
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+
+	s := newTestServerWith(k, t)
+	srv := s.(*loadBalancerServer)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.StartHealthChecks(ctx)
+
+	res, err := s.Apply(ctx, &ApplyRequest{
+		Name:   "quick",
+		IpAddr: asPtr("192.168.87.213"),
+		Targets: map[int32]*TargetList{
+			80: {Target: []*Target{{Protocol: Protocol_TCP, DstIP: "10.9.9.1", DstPort: int32(port)}}},
+		},
+	})
+	if err != nil || len(res.PortErrors) != 0 {
+		t.Fatalf("%v %+v", err, res)
+	}
+	key := fmt.Sprintf("10.9.9.1:%d", port)
+	waitFor := func(what string, limit time.Duration, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(limit)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	waitFor("the closed port to be taken out", 3*time.Second, func() bool { return destWeights(t, srv, "quick", 80)[key] == 0 })
+
+	start := time.Now()
+	l2 := listenIn(t, ns, fmt.Sprintf("10.9.9.1:%d", port))
+	acceptForever(l2)
+	waitFor("the target to come up", 5*time.Second, func() bool { return destWeights(t, srv, "quick", 80)[key] == 1 })
+	t.Logf("the target came up %v after its port opened", time.Since(start).Round(10*time.Millisecond))
+}
