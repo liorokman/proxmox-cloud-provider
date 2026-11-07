@@ -10,6 +10,10 @@ Kubernetes nodes, and this project provides the glue required to add a load bala
 and allow Kubernetes to configure it when `LoadBalancer` services are created.
 
 
+Further reading: [architecture](docs/architecture.md), the
+[configuration reference](docs/configuration.md) (chart values, `lbmanager.yaml`,
+`lbctl`, the bootstrap script) and the [road-map](docs/roadmap.md).
+
 # Tested versions
 
 | Component | Version |
@@ -86,18 +90,31 @@ using this cloud controller provider:
    pveum role add K8sCCM -privs "VM.Audit VM.GuestAgent.Audit"
    pveum role add K8sCCMNode -privs "Sys.Audit"
    pvesh create /pools --poolid k8s-red
-   pvesh set /pools/k8s-red --vms 1100,1101,1102     # the cluster's VMs and container
    pveum user add ccm-red@pve --comment "Kubernetes cloud controller of red"
    pveum acl modify /pool/k8s-red --users ccm-red@pve --roles K8sCCM
    pveum acl modify / --users ccm-red@pve --roles K8sCCMNode
    pveum user token add ccm-red@pve ccm --privsep 0
    ```
 
-   (Or create the pool first and use `--pool k8s-red` when cloning the VMs
-   and creating the container.) Without a pool the cloud provider falls back
+   The VMs and the container join the pool when they are created (`-pool k8s-red`
+   in the commands below; `pvesh set /pools/k8s-red --vms <ids>` adds existing
+   ones). Without a pool the cloud provider falls back
    to finding the node's VM by its name, among every VM it can see, and
    refuses to guess when two VMs have that name; a token with the roles on `/`
    still works.
+
+   > **Every node's VM must be in the pool.** The token can't see a VM outside
+   > it, so the cloud provider reports that the VM doesn't exist, and
+   > Kubernetes' node lifecycle controller then **deletes the Node object**,
+   > even though the VM is running. A node that is joining never finishes
+   > registering, and keeps its `node.cloudprovider.kubernetes.io/uninitialized`
+   > taint. This includes nodes you add later, by hand, with a script or with
+   > an autoscaler: add the VM to the pool first, when you create it
+   > (`qm clone ... --pool k8s-red`), or afterwards (`pvesh set /pools/k8s-red
+   > --vms <VM ID>`). The bootstrap script does this for its own VMs, and `up`
+   > adds any that are missing; it doesn't know about VMs that you made
+   > yourself. If that is a problem, grant the roles on `/` instead of the
+   > pool, as in earlier versions.
 
    Set `PROXMOX_API_TOKEN` to the generated token value, and set
    `PROXMOX_API_USERNAME` to the full token ID. In this example, the username
@@ -204,7 +221,7 @@ section, plus a volume for the state (the CA and the database), then give it its
 settings and start the units:
 
 ```bash
-pct create 1100 local:vztmpl/lbmanager-v0.3.0_amd64.tar.zst -unprivileged 0 \
+pct create 1100 local:vztmpl/lbmanager-v0.3.0_amd64.tar.zst -unprivileged 0 -pool k8s-red \
     -hostname k8slb1 -memory 512 -features nesting=1 -rootfs $STORAGE:4 \
     -mp0 $STORAGE:1,mp=/var/lib/lbstate,backup=1 \
     -net0 name=eth0,bridge=vmbr0,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW \
@@ -265,7 +282,7 @@ bootstrap script does this), but one container does not serve several clusters.
    ```bash
       DESCRIPTION="{\"ip\":\"$LB_EXT_IP\",\"mask\":24,\"start\":\"$LB_EXT_START\",\"end\":\"$LB_EXT_END\"}"
       pct create 1100  local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst  \
-          -unprivileged 0 \
+          -unprivileged 0 -pool k8s-red -tags "k8s;red;k8s-lb" \
           -cores 2 -swap 0 -memory 512 -hostname k8slb1  \
           -net0 name=eth0,bridge=vmbr0,firewall=1,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW,type=veth \
           -net1 name=eth1,bridge=k8s,firewall=1,ip=192.168.50.1/24,type=veth \
@@ -341,7 +358,8 @@ This README assumes that the template's ID is `$K8S_TEMPLATE_ID`
    set to to the ID.
 
    ```bash
-   qm clone $K8S_TEMPLATE_ID $K8S_NEW_ID -full -name k8s-master1 -storage $STORAGE
+   qm clone $K8S_TEMPLATE_ID $K8S_NEW_ID -full -name k8s-master1 -storage $STORAGE -pool k8s-red
+   qm set $K8S_NEW_ID -tags "k8s;red"
    ```
 
 1. Update the cloud-init parameters
@@ -648,7 +666,8 @@ doesn't matter. Nothing needs to be done by hand.
 * **Ambiguous names:** when a node has no provider ID and several VMs have its name, the
   cloud provider now reports an error instead of choosing one.
 * **Scoped token (optional):** the token can be restricted to the VMs of the cluster, see
-  "Prepare an API token". Existing tokens with the roles on `/` keep working.
+  "Prepare an API token". Existing tokens with the roles on `/` keep working. With a scoped
+  token, every node's VM must be in the pool, or Kubernetes deletes its Node object.
 * **Bootstrap script:** new clusters get a pool and their own Proxmox user,
   `ccm-<CLUSTER_NAME>@pve`, instead of the shared `ccm@pve`. Set `PVE_USER=ccm@pve` in the settings
   file of a cluster that was built before, or its next `up` creates a new user and token.
@@ -719,12 +738,20 @@ uses the same API. Nothing needs to be done by hand.
 
 # Development
 
+The project has a [Taskfile](https://taskfile.dev) (`task` lists the tasks):
+
 ```bash
-go build ./...
-go vet ./...
-go test ./...                       # the tests that don't need root
-scripts/test-privileged.sh devstack # also run every package as root on that host (ssh)
+task build                          # the three binaries, into ./bin
+task test                           # the tests that don't need root
+task test:privileged HOST=devstack  # also run every package as root on that host (ssh)
+task lint                           # golangci-lint, configured in .golangci.yml
+task vuln                           # govulncheck
+task check                          # vet, test, lint, vuln, and the chart and shell script checks
 ```
+
+`lint` and `vuln` run the tools at the versions pinned in the Taskfile, with `go run`, so
+nothing needs to be installed. Without `task`, the same is `go build ./...`, `go vet ./...`,
+`go test ./...` and `scripts/test-privileged.sh devstack`.
 
 Most of the load balancer is only exercised by tests that configure IPVS in a
 private network namespace, which needs real root (the kernel does not allow it
