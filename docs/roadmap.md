@@ -129,6 +129,15 @@ only set when a node registers, so existing nodes keep their old ones.
 10. A highly available load balancer pair with keepalived and conntrackd.
     Worth it with a second Proxmox node, or for upgrades without an outage; on
     one node it protects against container failures only, not host failures. **L**
+13. Hand the gateway role to SDN where the zone supports it (Simple zone SNAT,
+    EVPN exit nodes). Egress would survive a restart of the load balancer
+    container, and the container would only do ingress. But IPVS NAT needs the
+    replies to come back through the container, so either the nodes route the
+    LAN prefix via the container (breaking clients behind a router) or IPVS also
+    rewrites the client address (losing it, which is a verified feature). A Simple
+    zone doesn't span Proxmox nodes, EVPN exit nodes are tech preview and
+    untestable on one node, and the VXLAN zone used here has no SDN SNAT at all.
+    The HA pair is the more direct way to keep egress up. **M**
 
 Implementation notes for P0:
 
@@ -169,12 +178,3 @@ Proxmox IPAM was evaluated (on Proxmox VE 9.2) and does not fit the VIPs:
 The built-in allocator stays, and gets fixed (P0, item 1). A real NetBox
 shared by Proxmox and the project is the cleanest route if integration is ever
 wanted (P25, item 17).
-13. Hand the gateway role to SDN where the zone supports it (Simple zone SNAT,
-    EVPN exit nodes). Egress would survive a restart of the load balancer
-    container, and the container would only do ingress. But IPVS NAT needs the
-    replies to come back through the container, so either the nodes route the
-    LAN prefix via the container (breaking clients behind a router) or IPVS also
-    rewrites the client address (losing it, which is a verified feature). A Simple
-    zone doesn't span Proxmox nodes, EVPN exit nodes are tech preview and
-    untestable on one node, and the VXLAN zone used here has no SDN SNAT at all.
-    The HA pair is the more direct way to keep egress up. **M**
