@@ -203,8 +203,9 @@ first). The appliance has no SSH server and no root password: use `pct enter`.
 Each Kubernetes cluster requires a lightweight LXC container that will be used
 to configure an `IPVS` based load-balancer. 
 
- > Note: The current implementation supports only one load balancer container - this
-will be fixed in future versions of this project.
+ > Note: Every cluster has its own load balancer container, with its own VNet and
+address range. Several clusters on one Proxmox node work side by side (the
+bootstrap script does this), but one container does not serve several clusters.
 
 1. Create a subnet for the new cluster in the `k8s` VNet. Enable SNAT, and set
    the gateway IP to the first IP in the subnet.
