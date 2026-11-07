@@ -91,6 +91,12 @@ service controller does not pass nodes that carry the
 
 ### Network layout
 
+The hookscript below is the original way to build the container. The appliance
+(`scripts/build-appliance.sh`) does the same from systemd units inside a prebuilt
+template: `lb-network` (steps 1 to 4), and `lb-prepare` (the CA, the certificates
+and `lbmanager.yaml`, before every start of `lbmanager`), with the settings in
+`/etc/lbmanager/appliance.env` and the state on a separate volume.
+
 The container is created with three interfaces: `eth0` (management, in the
 root namespace), `eth1` (the VNet) and `eth2` (the LAN, without a Proxmox
 address). `scripts/installLB.sh` is run as the container's hookscript, and on

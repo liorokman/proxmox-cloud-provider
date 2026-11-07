@@ -1,0 +1,13 @@
+[Unit]
+Description=Load balancer network namespace
+ConditionPathExists=/etc/lbmanager/appliance.env
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lb-network
+
+[Install]
+WantedBy=multi-user.target

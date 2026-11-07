@@ -81,7 +81,9 @@ fi
 
 # Load balancer container
 : "${LB_VMID:=1100}"
-: "${LB_TEMPLATE:=debian-13-standard_13.6-1_amd64.tar.zst}"
+: "${LB_MODE:=appliance}"                  # appliance (a prebuilt template, built when missing) or hookscript (stock Debian + installLB.sh)
+: "${LB_STATE_GB:=1}"                     # appliance: size of the volume that keeps the CA and the database
+: "${LB_TEMPLATE:=debian-13-standard_13.6-1_amd64.tar.zst}"   # hookscript mode only
 : "${LB_TEMPLATE_STORAGE:=local}"
 : "${LB_ROOT_PASSWORD:=}"                 # default: random, not stored
 : "${LBMANAGER_VERSION:=}"                # release to download (default: the hookscript's)
@@ -242,8 +244,18 @@ step_sdn() {
 	fi
 }
 
-step_loadbalancer() {
-	log "Load balancer container $LB_VMID"
+lb_desc() {
+	jq -nc --arg ip "$LB_EXT_IP" --argjson mask "$LAN_CIDR_BITS" --arg s "$LB_EXT_START" --arg e "$LB_EXT_END" \
+		'{ip:$ip, mask:$mask, start:$s, end:$e}'
+}
+
+lb_nics() {
+	echo "-net0 name=eth0,bridge=$LAN_BRIDGE,firewall=1,ip=$LB_MGMT_IP/$LAN_CIDR_BITS,gw=$LAN_GW,type=veth"
+	echo "-net1 name=eth1,bridge=$VNET,firewall=1,ip=$GATEWAY_IP/24,type=veth"
+	echo "-net2 name=eth2,bridge=$LAN_BRIDGE,firewall=1,type=veth"
+}
+
+create_lb_hookscript() {
 	local snippets
 	snippets=$(dirname "$(pvesm path "$SNIPPET_STORAGE:snippets/installLB.sh")")
 	mkdir -p "$snippets"
@@ -254,29 +266,57 @@ step_loadbalancer() {
 	if [ -n "$LBMANAGER_BIN_DIR" ]; then
 		for b in lbmanager lbctl; do install -m 0755 "$LBMANAGER_BIN_DIR/$b" "$snippets/$b"; done
 	fi
+	if ! pveam list "$LB_TEMPLATE_STORAGE" 2> /dev/null | grep -q "$LB_TEMPLATE"; then
+		pveam update > /dev/null
+		pveam download "$LB_TEMPLATE_STORAGE" "$LB_TEMPLATE"
+	fi
+	local pw=${LB_ROOT_PASSWORD:-$(head -c 24 /dev/urandom | base64)}
+	# shellcheck disable=SC2046
+	pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$LB_TEMPLATE" \
+		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" $(lb_nics) \
+		-ostype debian -features nesting=1 -password "$pw" -storage "$STORAGE" \
+		-description "$(lb_desc)" -onboot 1 > /dev/null
+	pct set "$LB_VMID" -hookscript "$SNIPPET_STORAGE:snippets/installLB.sh"
+}
 
+create_lb_appliance() {
+	local name
+	if [ -n "$LBMANAGER_BIN_DIR" ]; then name=lbmanager-dev
+	else name=lbmanager-${LBMANAGER_VERSION:-$(sed -n 's/^LBMANAGER_VERSION=\${LBMANAGER_VERSION:-\(.*\)}/\1/p' "$SCRIPT_DIR/installLB.sh")}; fi
+	local tmpl=${name}_amd64.tar.zst
+	if ! pveam list "$LB_TEMPLATE_STORAGE" 2> /dev/null | grep -q "$tmpl"; then
+		info "building the load balancer appliance $tmpl"
+		STORAGE=$STORAGE TEMPLATE_STORAGE=$LB_TEMPLATE_STORAGE BUILD_BRIDGE=$LAN_BRIDGE \
+			LBMANAGER_VERSION=$LBMANAGER_VERSION LBMANAGER_BIN_DIR=$LBMANAGER_BIN_DIR "$SCRIPT_DIR/build-appliance.sh" > /dev/null
+	fi
+	# shellcheck disable=SC2046
+	pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$tmpl" \
+		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" $(lb_nics) \
+		-ostype debian -features nesting=1 -rootfs "$STORAGE:4" -mp0 "$STORAGE:$LB_STATE_GB,mp=/var/lib/lbstate,backup=1" \
+		-description "$(lb_desc)" -onboot 1 > /dev/null
+}
+
+step_loadbalancer() {
+	log "Load balancer container $LB_VMID ($LB_MODE)"
 	if ! ct_exists "$LB_VMID"; then
-		if ! pveam list "$LB_TEMPLATE_STORAGE" 2> /dev/null | grep -q "$LB_TEMPLATE"; then
-			pveam update > /dev/null
-			pveam download "$LB_TEMPLATE_STORAGE" "$LB_TEMPLATE"
-		fi
-		local pw=${LB_ROOT_PASSWORD:-$(head -c 24 /dev/urandom | base64)}
-		local desc
-		desc=$(jq -nc --arg ip "$LB_EXT_IP" --argjson mask "$LAN_CIDR_BITS" --arg s "$LB_EXT_START" --arg e "$LB_EXT_END" \
-			'{ip:$ip, mask:$mask, start:$s, end:$e}')
-		# The description is kept URL encoded by Proxmox, and decoded by the hookscript
-		pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$LB_TEMPLATE" \
-			-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" \
-			-net0 "name=eth0,bridge=$LAN_BRIDGE,firewall=1,ip=$LB_MGMT_IP/$LAN_CIDR_BITS,gw=$LAN_GW,type=veth" \
-			-net1 "name=eth1,bridge=$VNET,firewall=1,ip=$GATEWAY_IP/24,type=veth" \
-			-net2 "name=eth2,bridge=$LAN_BRIDGE,firewall=1,type=veth" \
-			-ostype debian -features nesting=1 -password "$pw" -storage "$STORAGE" \
-			-description "$desc" -onboot 1 > /dev/null
-		pct set "$LB_VMID" -hookscript "$SNIPPET_STORAGE:snippets/installLB.sh"
+		case "$LB_MODE" in
+			appliance) create_lb_appliance ;;
+			hookscript) create_lb_hookscript ;;
+			*) die "LB_MODE must be appliance or hookscript" ;;
+		esac
 		info "created container $LB_VMID"
 	fi
 	if [ "$(pct status "$LB_VMID" | awk '{print $2}')" != running ]; then
 		pct start "$LB_VMID"
+	fi
+	if [ "$LB_MODE" = appliance ] && ! pct exec "$LB_VMID" -- test -f /etc/lbmanager/appliance.env; then
+		# The units in the image wait for this file
+		local env; env=$(mktemp)
+		printf 'EXT_IP=%s\nEXT_MASK=%s\nRANGE_START=%s\nRANGE_END=%s\n' "$LB_EXT_IP" "$LAN_CIDR_BITS" "$LB_EXT_START" "$LB_EXT_END" > "$env"
+		wait_for "the container to boot" 24 pct exec "$LB_VMID" -- true
+		pct push "$LB_VMID" "$env" /etc/lbmanager/appliance.env --perms 0644
+		rm -f "$env"
+		pct exec "$LB_VMID" -- systemctl start lb-network lbmanager
 	fi
 	wait_for "lbmanager to start" 60 pct exec "$LB_VMID" -- systemctl is-active --quiet lbmanager
 	# The first start of lbmanager can be before its certificates are readable

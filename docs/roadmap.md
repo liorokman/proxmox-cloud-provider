@@ -113,7 +113,7 @@ only set when a node registers, so existing nodes keep their old ones.
 ### P2: bigger steps
 
 10. A highly available load balancer pair with keepalived and conntrackd. **L**
-11. A prebuilt load balancer appliance (template or OCI image). **M**
+11. ~~A prebuilt load balancer appliance~~ (done as a container template: `scripts/build-appliance.sh`; an OCI image is still open). **M**
 12. Several clusters per load balancer container, one VNet each. **M**
 13. Hand the gateway role to SDN where the zone supports it (simple zone SNAT,
     EVPN exit nodes). **M**

@@ -1,0 +1,58 @@
+#!/bin/bash
+# Run before lbmanager starts: create the CA and the certificates once, and
+# write the configuration files. The state (CA, database) lives in
+# /var/lib/lbstate, which can be a separate volume that outlives the container.
+set -euo pipefail
+. /etc/lbmanager/appliance.env
+
+STATE=/var/lib/lbstate
+MGMT_IP=$(ip -j addr show dev eth0 | jq -r '.[0].addr_info[] | select(.family == "inet") | .local' | head -1)
+[ -n "$MGMT_IP" ] || { echo "eth0 has no address" >&2; exit 1; }
+
+mkdir -p $STATE/ca $STATE/db /etc/lbmanager
+if [ ! -f $STATE/ca/ca.pem ]; then
+	cd $STATE/ca
+	echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"HomeLab","CN":"Root LB CA"}]}' | cfssl genkey -initca - | cfssljson -bare ca
+	echo "{\"hosts\":[\"$MGMT_IP\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":\"Homelab\",\"CN\":\"$MGMT_IP\"}]}" \
+		| cfssl gencert -ca ca.pem -ca-key ca-key.pem - | cfssljson -bare lbmanager
+	echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"Homelab","CN":"lbctl"}]}' \
+		| cfssl gencert -ca ca.pem -ca-key ca-key.pem - | cfssljson -bare lbctl
+	chmod 600 $STATE/ca/*-key.pem
+fi
+cp $STATE/ca/lbmanager.pem /etc/lbmanager/cert.pem
+cp $STATE/ca/lbmanager-key.pem /etc/lbmanager/key.pem
+cp $STATE/ca/lbctl.pem /etc/lbmanager/lbctl.pem
+cp $STATE/ca/lbctl-key.pem /etc/lbmanager/lbctl-key.pem
+cp $STATE/ca/ca.pem /etc/lbmanager/ca.pem
+
+cat > /etc/lbmanager/lbmanager.yaml << END
+---
+grpc:
+  listen: 0.0.0.0
+  port: 9999
+  auth:
+    cert: /etc/lbmanager/cert.pem
+    key: /etc/lbmanager/key.pem
+    ca: /etc/lbmanager/ca.pem
+dbDir: $STATE/db
+loadbalancer:
+  namespace: LB
+  externalInterface: eth2
+  internalInterface: eth1
+  ipam:
+    cidr: $EXT_IP/$EXT_MASK
+    dynamicRange:
+      startAt: $RANGE_START
+      endAt: $RANGE_END
+metrics:
+  listen: $MGMT_IP:9100
+END
+
+cat > /etc/lbmanager/lbctl.yaml << END
+---
+addr: $MGMT_IP:9999
+auth:
+  clientKey: /etc/lbmanager/lbctl-key.pem
+  clientCert: /etc/lbmanager/lbctl.pem
+  caFile: /etc/lbmanager/ca.pem
+END

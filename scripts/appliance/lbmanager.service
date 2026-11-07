@@ -1,0 +1,13 @@
+[Unit]
+Description=LoadBalancer Manager
+ConditionPathExists=/etc/lbmanager/appliance.env
+Requires=lb-network.service
+After=lb-network.service
+
+[Service]
+ExecStartPre=/usr/local/sbin/lb-prepare
+ExecStart=/usr/local/bin/lbmanager
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

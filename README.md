@@ -160,6 +160,44 @@ below are what the script does, if you want to do them by hand.
    outside the range (and the container's own addresses) when a Service asks
    for a specific `loadBalancerIP`.
 
+## The load balancer appliance
+
+Instead of the stock Debian container and hookscript described in the next
+section, you can build a container template once, with `lbmanager`, `lbctl` and
+all the packages installed, and the network set up by systemd units inside it:
+
+```bash
+scripts/build-appliance.sh      # -> <template storage>/vztmpl/lbmanager-<version>_amd64.tar.zst
+```
+
+The build downloads `lbmanager` from the release (verifying `SHA256SUMS`), or
+uses your own binaries with `LBMANAGER_BIN_DIR=/path`. The build container needs
+DHCP and internet access on `BUILD_BRIDGE` (default `vmbr0`). The bootstrap
+script builds the template by itself when it is missing (`LB_MODE=appliance`, the
+default; `LB_MODE=hookscript` keeps the older way).
+
+To create the container by hand, use the same three interfaces as in the next
+section, plus a volume for the state (the CA and the database), then give it its
+settings and start the units:
+
+```bash
+pct create 1100 local:vztmpl/lbmanager-v0.2.0_amd64.tar.zst -unprivileged 0 \
+    -hostname k8slb1 -memory 512 -features nesting=1 -rootfs $STORAGE:4 \
+    -mp0 $STORAGE:1,mp=/var/lib/lbstate,backup=1 \
+    -net0 name=eth0,bridge=vmbr0,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW \
+    -net1 name=eth1,bridge=k8s,ip=192.168.50.1/24 \
+    -net2 name=eth2,bridge=vmbr0
+pct start 1100
+printf 'EXT_IP=%s\nEXT_MASK=%s\nRANGE_START=%s\nRANGE_END=%s\n' $LB_EXT_IP 24 $LB_EXT_START $LB_EXT_END > /tmp/appliance.env
+pct push 1100 /tmp/appliance.env /etc/lbmanager/appliance.env
+pct exec 1100 -- systemctl start lb-network lbmanager
+```
+
+After that, the container starts by itself, and survives reboots without any
+hookscript. Upgrading `lbmanager` means building a newer template and replacing
+the container, moving the `/var/lib/lbstate` volume across (untested; back it up
+first). The appliance has no SSH server and no root password: use `pct enter`.
+
 ## Setup a LoadBalancer LXC Container
 
 Each Kubernetes cluster requires a lightweight LXC container that will be used

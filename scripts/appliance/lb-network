@@ -1,0 +1,50 @@
+#!/bin/bash
+# Build the network environment of the load balancer: the "LB" network
+# namespace with eth1 (the cluster's VNet) and eth2 (the LAN) in it, forwarding,
+# and source NAT. eth0 stays outside as the management interface.
+# Settings come from /etc/lbmanager/appliance.env:
+#   EXT_IP, EXT_MASK   the load balancer's own address on the LAN
+#   EXT_GW             the LAN's gateway (default: eth0's default gateway)
+set -euo pipefail
+. /etc/lbmanager/appliance.env
+
+# Already set up (the service was restarted without the container)
+if ip netns list | grep -qw LB; then exit 0; fi
+
+# The container's own network may still be coming up
+for i in $(seq 1 30); do
+	EXT_GW=${EXT_GW:-$(ip -j route | jq -r '.[] | select(.dst == "default") | .gateway' | head -1)}
+	[ -n "$EXT_GW" ] && break
+	sleep 1
+done
+[ -n "$EXT_GW" ] || { echo "no LAN gateway: set EXT_GW" >&2; exit 1; }
+for i in eth1 eth2; do ip link show dev $i > /dev/null || { echo "$i is missing: the appliance needs three network interfaces" >&2; exit 1; }; done
+
+ip netns add LB
+ip netns exec LB ip link set lo up
+
+# eth1 keeps the address that Proxmox gave it (the VNet gateway)
+ETH1_ADDR=$(ip -j addr show dev eth1 | jq -r '.[0].addr_info[] | select(.family == "inet") | (.local) + "/" + (.prefixlen|tostring)')
+ip link set eth1 netns LB
+ip netns exec LB ip addr add "$ETH1_ADDR" dev eth1
+ip netns exec LB ip link set eth1 up
+
+# eth2 is the LAN side. IPv6 is not supported, and the LAN's router
+# advertisements must not give it an address. A gratuitous ARP announces
+# each new address, so the LAN notices a changed MAC address.
+ip link set eth2 netns LB
+ip netns exec LB sysctl -q net.ipv6.conf.eth2.disable_ipv6=1
+ip netns exec LB sysctl -q net.ipv4.conf.eth2.arp_notify=1
+ip netns exec LB ip link set eth2 up
+ip netns exec LB ip addr add "$EXT_IP/$EXT_MASK" dev eth2
+ip netns exec LB ip route add default via "$EXT_GW"
+
+ip netns exec LB sysctl -q net.ipv4.ip_forward=1
+ip netns exec LB sysctl -q net.ipv4.vs.conntrack=1
+
+# Source NAT, so this container is the cluster's gateway to the LAN and the internet.
+# Connections from inside the VNet to a load balancer address must also have their
+# source rewritten, otherwise the target answers the client directly.
+ETH1_NET=$(ip netns exec LB ip -j route show dev eth1 scope link | jq -r '.[0].dst')
+ip netns exec LB iptables -t nat -A POSTROUTING -s "$ETH1_NET" -d "$ETH1_NET" -m ipvs --ipvs -j MASQUERADE
+ip netns exec LB iptables -t nat -A POSTROUTING -o eth2 -j SNAT --to-source "$EXT_IP"
