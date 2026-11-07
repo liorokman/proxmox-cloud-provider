@@ -112,7 +112,6 @@ only set when a node registers, so existing nodes keep their old ones.
 
 ### P2: bigger steps
 
-10. A highly available load balancer pair with keepalived and conntrackd. **L**
 11. ~~A prebuilt load balancer appliance~~ (done as a container template: `scripts/build-appliance.sh`; an OCI image is still open). **M**
 13. Hand the gateway role to SDN where the zone supports it (simple zone SNAT,
     EVPN exit nodes). **M**
@@ -129,6 +128,9 @@ only set when a node registers, so existing nodes keep their old ones.
     releases with checksums and a signed image. **S–M**
 17. An optional allocator backend that uses a real NetBox, which Proxmox can
     also use as the IPAM of the VNets. **M**
+10. A highly available load balancer pair with keepalived and conntrackd.
+    Worth it with a second Proxmox node, or for upgrades without an outage; on
+    one node it protects against container failures only, not host failures. **L**
 
 Implementation notes for P0:
 
