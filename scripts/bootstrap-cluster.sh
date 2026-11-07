@@ -119,9 +119,13 @@ fi
 : "${CNI_MANIFEST:=https://github.com/flannel-io/flannel/releases/download/v0.28.0/kube-flannel.yml}"
 
 # Cloud provider
-: "${PVE_USER:=ccm@pve}"
-: "${PVE_TOKEN_NAME:=ccm-$CLUSTER_NAME}"   # one token per cluster
-: "${PVE_ROLE:=K8sCCM}"
+: "${PVE_USER:=ccm-$CLUSTER_NAME@pve}"    # one user and one token per cluster
+: "${PVE_TOKEN_NAME:=ccm-$CLUSTER_NAME}"
+: "${PVE_ROLE:=K8sCCM}"                   # on the cluster's pool: see the VMs and ask their guest agents
+: "${PVE_NODE_ROLE:=K8sCCMNode}"          # on /: Sys.Audit, for the node and cluster status
+: "${POOL:=k8s-$CLUSTER_NAME}"            # the cluster's VMs and container. The token only sees these
+: "${HA:=no}"                             # yes: make the VMs and the container HA resources, with anti-affinity rules (needs a Proxmox cluster)
+: "${TAGS:=k8s;$CLUSTER_NAME}"            # Proxmox tags of the VMs and the container; the VMs' become node labels
 : "${CHART_DIR:=$REPO_DIR/chart}"
 : "${IMAGE_TAG:=}"                        # default: the chart's appVersion
 : "${IMAGE_ARCHIVE:=}"                    # optional: a docker/OCI image archive to load into every node (for an image that is not published yet)
@@ -293,7 +297,7 @@ create_lb_hookscript() {
 	pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$LB_TEMPLATE" \
 		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" $(lb_nics) \
 		-ostype debian -features nesting=1 -password "$pw" -storage "$STORAGE" \
-		-description "$(lb_desc)" -onboot 1 > /dev/null
+		-description "$(lb_desc)" -onboot 1 -tags "$TAGS;k8s-lb" -pool "$POOL" > /dev/null
 	pct set "$LB_VMID" -hookscript "$SNIPPET_STORAGE:snippets/installLB.sh"
 }
 
@@ -311,7 +315,7 @@ create_lb_appliance() {
 	pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$tmpl" \
 		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" $(lb_nics) \
 		-ostype debian -features nesting=1 -rootfs "$STORAGE:4" -mp0 "$STORAGE:$LB_STATE_GB,mp=/var/lib/lbstate,backup=1" \
-		-description "$(lb_desc)" -onboot 1 > /dev/null
+		-description "$(lb_desc)" -onboot 1 -tags "$TAGS;k8s-lb" -pool "$POOL" > /dev/null
 }
 
 step_loadbalancer() {
@@ -345,13 +349,27 @@ step_loadbalancer() {
 	fi
 }
 
+# The pool exists before the first guest, which is created in it
+step_create_pool() {
+	log "Pool $POOL"
+	if ! pve get /pools | jq -e --arg p "$POOL" '.[] | select(.poolid == $p)' > /dev/null; then
+		pvesh create /pools --poolid "$POOL" --comment "Kubernetes cluster $CLUSTER_NAME" > /dev/null
+		info "created pool $POOL"
+	fi
+}
+
 step_credentials() {
-	log "Proxmox API token for the cloud provider"
+	log "Proxmox pool and API token for the cloud provider"
+	# The token sees the VMs of this cluster only: the role is granted on its pool. Sys.Audit is
+	# needed on / (for the cluster name and the node status), and gives no access to any VM.
 	pveum role list --output-format json | jq -e --arg r "$PVE_ROLE" '.[] | select(.roleid == $r)' > /dev/null \
-		|| pveum role add "$PVE_ROLE" -privs "VM.Audit Sys.Audit VM.GuestAgent.Audit"
+		|| pveum role add "$PVE_ROLE" -privs "VM.Audit VM.GuestAgent.Audit"
+	pveum role list --output-format json | jq -e --arg r "$PVE_NODE_ROLE" '.[] | select(.roleid == $r)' > /dev/null \
+		|| pveum role add "$PVE_NODE_ROLE" -privs "Sys.Audit"
 	pveum user list --output-format json | jq -e --arg u "$PVE_USER" '.[] | select(.userid == $u)' > /dev/null \
-		|| pveum user add "$PVE_USER" --comment "Kubernetes cloud controller"
-	pveum acl modify / --users "$PVE_USER" --roles "$PVE_ROLE"
+		|| pveum user add "$PVE_USER" --comment "Kubernetes cloud controller of $CLUSTER_NAME"
+	pveum acl modify "/pool/$POOL" --users "$PVE_USER" --roles "$PVE_ROLE"
+	pveum acl modify / --users "$PVE_USER" --roles "$PVE_NODE_ROLE"
 	local secret=$STATE_DIR/$PVE_USER.$PVE_TOKEN_NAME.token
 	local exists
 	exists=$(pveum user token list "$PVE_USER" --output-format json | jq -r --arg t "$PVE_TOKEN_NAME" '[.[] | select(.tokenid == $t)] | length')
@@ -371,10 +389,10 @@ step_vms() {
 	for ((i = 0; i <= WORKERS; i++)); do
 		id=$(node_vmid "$i"); name=$(node_name "$i"); ip=$(node_ip "$i")
 		if ! vm_exists "$id"; then
-			qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" > /dev/null
+			qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
 			qm set "$id" --cores "$NODE_CORES" --memory "$NODE_MEMORY" --agent enabled=1 \
 				--net0 "virtio,bridge=$VNET" --ipconfig0 "ip=$ip/24,gw=$GATEWAY_IP" \
-				--nameserver "$DNS_SERVER" --sshkeys "$SSH_PUBLIC_KEY_FILE" --onboot 1 > /dev/null
+				--nameserver "$DNS_SERVER" --sshkeys "$SSH_PUBLIC_KEY_FILE" --onboot 1 --tags "$TAGS" > /dev/null
 			qm disk resize "$id" virtio0 "${NODE_DISK_GB}G" > /dev/null
 			qm cloudinit update "$id"
 			info "created $name ($id) at $ip"
@@ -384,6 +402,42 @@ step_vms() {
 	for ((i = 0; i <= WORKERS; i++)); do
 		wait_for "the guest agent of $(node_name "$i")" 60 qm agent "$(node_vmid "$i")" ping
 	done
+}
+
+# Guests that were created before the pool (earlier versions of this script) are added too
+step_pool() {
+	local members id i
+	members=$(pve get "/pools/$POOL" | jq -r '.members[]?.vmid' 2> /dev/null || true)
+	for id in "$LB_VMID" $(for ((i = 0; i <= WORKERS; i++)); do node_vmid "$i"; done); do
+		grep -qx "$id" <<< "$members" && continue
+		pvesh set "/pools/$POOL" --vms "$id" > /dev/null
+		info "added $id to the pool"
+	done
+}
+
+# HA resources, and rules that keep the load balancer away from the control plane, and the
+# workers away from each other (when there are hosts enough for that). Proxmox does
+# the placing, and the HA manager may migrate the VMs: the cloud provider updates the node labels.
+step_ha() {
+	[ "$HA" = yes ] || return 0
+	log "High availability"
+	local nodes i id
+	nodes=$(pve get /nodes | jq 'length')
+	[ "$nodes" -ge 2 ] || { info "HA=yes needs a Proxmox cluster of 2 nodes or more, skipping"; return 0; }
+	pve get /cluster/ha/resources > /dev/null || die "cannot read the HA resources (is this node in a cluster?)"
+	for id in "vm:$(node_vmid 0)" $(for ((i = 1; i <= WORKERS; i++)); do echo "vm:$(node_vmid "$i")"; done) "ct:$LB_VMID"; do
+		pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null \
+			|| { pvesh create /cluster/ha/resources --sid "$id" --state started > /dev/null; info "HA resource $id"; }
+	done
+	ha_rule "ha-$CLUSTER_NAME-lb" "ct:$LB_VMID,vm:$(node_vmid 0)"
+	if [ "$WORKERS" -ge 2 ] && [ "$WORKERS" -le "$nodes" ]; then
+		ha_rule "ha-$CLUSTER_NAME-workers" "$(for ((i = 1; i <= WORKERS; i++)); do printf 'vm:%s,' "$(node_vmid "$i")"; done | sed 's/,$//')"
+	fi
+}
+
+ha_rule() { # name resources: keep the resources on different hosts
+	pve get /cluster/ha/rules | jq -e --arg r "$1" '.[] | select(.rule == $r)' > /dev/null \
+		|| { pvesh create /cluster/ha/rules --rule "$1" --type resource-affinity --affinity negative --resources "$2" > /dev/null; info "HA rule $1"; }
 }
 
 prepare_kubelet() { # vmid
@@ -522,9 +576,12 @@ wait_ready() { # count
 cmd_up() {
 	preflight
 	step_sdn
+	step_create_pool
 	step_loadbalancer
 	step_credentials
 	step_vms
+	step_pool
+	step_ha
 	step_control_plane
 	step_workers
 	step_load_image
@@ -558,6 +615,15 @@ cmd_destroy() {
 	derive_network
 	log "Destroying cluster $CLUSTER_NAME"
 	local i id
+	# HA resources first: the HA manager would start the guests again
+	if pve get /cluster/ha/rules 2> /dev/null | jq -e '.' > /dev/null 2>&1; then
+		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-workers"; do
+			pve get /cluster/ha/rules | jq -e --arg r "$r" '.[] | select(.rule == $r)' > /dev/null && pvesh delete "/cluster/ha/rules/$r" > /dev/null
+		done
+		for id in "ct:$LB_VMID" $(for ((i = 0; i <= WORKERS; i++)); do echo "vm:$(node_vmid "$i")"; done); do
+			pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null && pvesh delete "/cluster/ha/resources/$id" > /dev/null
+		done
+	fi
 	for ((i = WORKERS; i >= 0; i--)); do
 		id=$(node_vmid "$i")
 		if vm_exists "$id"; then
@@ -577,12 +643,19 @@ cmd_destroy() {
 		done
 		pvesh delete "/cluster/sdn/vnets/$VNET" > /dev/null
 		pvesh set /cluster/sdn > /dev/null
-		info "deleted VNet $VNET (the zone $ZONE and the Proxmox user and role are kept)"
+		info "deleted VNet $VNET (the zone $ZONE and the roles are kept)"
 	fi
 	# The token is named after the cluster, so it isn't used by anything else
 	if [ -s "$STATE_DIR/$PVE_USER.$PVE_TOKEN_NAME.token" ]; then
 		pveum user token remove "$PVE_USER" "$PVE_TOKEN_NAME" > /dev/null 2>&1 || true
 		rm -f "$STATE_DIR/$PVE_USER.$PVE_TOKEN_NAME.token"
+	fi
+	if pve get /pools | jq -e --arg p "$POOL" '.[] | select(.poolid == $p)' > /dev/null; then
+		pvesh delete "/pools/$POOL" > /dev/null && info "deleted pool $POOL"
+	fi
+	# A user that is named after the cluster is not shared (the ACLs go with it)
+	if [ "$PVE_USER" = "ccm-$CLUSTER_NAME@pve" ]; then
+		pveum user delete "$PVE_USER" > /dev/null 2>&1 || true
 	fi
 	ip route del "$NODE_SUBNET" via "$LB_EXT_IP" 2> /dev/null || true
 	rm -f "$KUBECONFIG_OUT"
