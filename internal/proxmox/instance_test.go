@@ -31,6 +31,9 @@ func TestParseProviderID(t *testing.T) {
 		good bool
 	}{
 		{"proxmox:///pve1/1101", 1101, true},
+		{"proxmox://homelab/1101", 1101, true},
+		{"proxmox:///1101", 1101, true},
+		{"proxmox://homelab/abc", 0, false},
 		{"", 0, false},
 		{"proxmox:///pve1", 0, false},
 		{"proxmox:///pve1/abc", 0, false},
@@ -73,7 +76,7 @@ func TestGetAddresses(t *testing.T) {
 
 func TestGetProviderID(t *testing.T) {
 	vm := &proxmox.VirtualMachine{Node: "pve1", VMID: 1101}
-	if got := getProviderID(vm); got != "proxmox:///pve1/1101" {
+	if got := getProviderID("homelab", vm); got != "proxmox://homelab/1101" {
 		t.Errorf("got %s", got)
 	}
 }

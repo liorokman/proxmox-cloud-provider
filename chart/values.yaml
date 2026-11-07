@@ -43,6 +43,9 @@ proxmox:
   insecure: false
   caCert:
   timeout: 5
+  # Seconds between updates of the node labels from the VMs (zone, size, tags).
+  # Negative turns it off.
+  labelSyncInterval: 60
 
 
 # imagePullSecrets: []

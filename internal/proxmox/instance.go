@@ -41,7 +41,11 @@ import (
 
 	ProviderID for Proxmox based kubernetes nodes uses the following schema:
 
-	proxmox://[cluster name]/[node name]/[vm id]
+	proxmox://[cluster name]/[vm id]
+
+	This is the form that the Proxmox CSI plugin (sergelogvinov/proxmox-csi-plugin) expects. The cluster
+	name is the node's region. Nodes registered by earlier versions have proxmox:///[pve node]/[vm id],
+	which is still understood. A providerID can't be changed once the node has one.
 
 */
 
@@ -148,11 +152,14 @@ func (i *Instances) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloud
 		clusterName = defaultRegion
 	}
 	retval := &cloudprovider.InstanceMetadata{
-		ProviderID:    getProviderID(vm),
+		ProviderID:    getProviderID(clusterName, vm),
 		InstanceType:  instanceType(vm.CPUs, vm.MaxMem),
 		NodeAddresses: nodeAddresses(vm.VirtualMachineConfig, agentIfaces),
 		Zone:          vm.Node,
 		Region:        clusterName,
+	}
+	if vm.VirtualMachineConfig != nil {
+		retval.AdditionalLabels = tagLabels(vm.VirtualMachineConfig.Tags)
 	}
 
 	log.Printf("Metadata returns %+v", retval)
@@ -261,12 +268,12 @@ func getAddresses(config *proxmox.VirtualMachineConfig) []v1.NodeAddress {
 	return retval
 }
 
-func getProviderID(vm *proxmox.VirtualMachine) string {
-	// TODO: the cluster name is not retrieved, leave it empty for now.
-	return fmt.Sprintf("proxmox://%s/%s/%d", "", vm.Node, uint64(vm.VMID))
+func getProviderID(region string, vm *proxmox.VirtualMachine) string {
+	return fmt.Sprintf("proxmox://%s/%d", region, uint64(vm.VMID))
 }
 
-// parseProviderID extracts the VM ID out of a providerID of the form proxmox:///<node>/<vmid>
+// parseProviderID extracts the VM ID out of a providerID of the form proxmox://<cluster>/<vmid>,
+// or of the older form proxmox:///<node>/<vmid>
 func parseProviderID(providerID string) (int, bool) {
 	if providerID == "" {
 		return 0, false
@@ -277,17 +284,41 @@ func parseProviderID(providerID string) (int, bool) {
 		return 0, false
 	}
 	parts := strings.Split(providerURL.Path, "/")
-	// The expected format is "/node name/vm id"
-	if len(parts) != 3 {
-		log.Printf("ignoring invalid providerID: %s, path should be '<node>/<id>'", providerID)
+	// The path is "/vm id", or "/node name/vm id" in the older form
+	if len(parts) != 2 && len(parts) != 3 {
+		log.Printf("ignoring invalid providerID: %s, it should be 'proxmox://<cluster>/<id>'", providerID)
 		return 0, false
 	}
-	id, err := strconv.Atoi(parts[2])
+	id, err := strconv.Atoi(parts[len(parts)-1])
 	if err != nil {
 		log.Printf("ignoring invalid providerID: %s, id part is not numeric: %s", providerID, err.Error())
 		return 0, false
 	}
 	return id, true
+}
+
+// matchResource finds the virtual machine of a Kubernetes node among the cluster
+// resources, first by the providerID and otherwise by the VM name. A name that
+// several VMs have is ambiguous and is an error: guessing could attach a node to
+// the VM of another cluster.
+func matchResource(resources proxmox.ClusterResources, node *v1.Node) (*proxmox.ClusterResource, error) {
+	vmid, byID := parseProviderID(node.Spec.ProviderID)
+	var match *proxmox.ClusterResource
+	for _, r := range resources {
+		if r.Type != "qemu" || r.Template != 0 {
+			continue
+		}
+		if (byID && r.VMID == uint64(vmid)) || (!byID && r.Name == node.Name) {
+			if match != nil {
+				return nil, fmt.Errorf("node %s matches several virtual machines (%d and %d): set its providerID", node.Name, match.VMID, r.VMID)
+			}
+			match = r
+		}
+	}
+	if match == nil {
+		return nil, fmt.Errorf("%w: node %s (providerID %q)", errVMNotFound, node.Name, node.Spec.ProviderID)
+	}
+	return match, nil
 }
 
 // findVM locates the virtual machine backing a Kubernetes node, first by the providerID
@@ -306,19 +337,9 @@ func (i *Instances) findVM(ctx context.Context, node *v1.Node) (*proxmox.Virtual
 		return nil, "", err
 	}
 
-	vmid, byID := parseProviderID(node.Spec.ProviderID)
-	var match *proxmox.ClusterResource
-	for _, r := range resources {
-		if r.Type != "qemu" || r.Template != 0 {
-			continue
-		}
-		if (byID && r.VMID == uint64(vmid)) || (!byID && r.Name == node.Name) {
-			match = r
-			break
-		}
-	}
-	if match == nil {
-		return nil, "", fmt.Errorf("%w: node %s (providerID %q)", errVMNotFound, node.Name, node.Spec.ProviderID)
+	match, err := matchResource(resources, node)
+	if err != nil {
+		return nil, "", err
 	}
 
 	pveNode, err := i.client.Node(ctx, match.Node)

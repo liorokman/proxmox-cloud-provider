@@ -11,11 +11,13 @@ require (
 	github.com/rosedblabs/rosedb/v2 v2.2.1
 	github.com/vishvananda/netlink v1.3.1
 	github.com/vishvananda/netns v0.0.5
+	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
+	k8s.io/client-go v0.37.2
 	k8s.io/cloud-provider v0.37.2
 	k8s.io/component-base v0.37.2
 	k8s.io/klog/v2 v2.140.0
@@ -116,7 +118,6 @@ require (
 	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
@@ -126,7 +127,6 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	k8s.io/apiserver v0.37.2 // indirect
-	k8s.io/client-go v0.37.2 // indirect
 	k8s.io/component-helpers v0.37.2 // indirect
 	k8s.io/controller-manager v0.37.2 // indirect
 	k8s.io/kms v0.37.2 // indirect

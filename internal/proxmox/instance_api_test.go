@@ -102,7 +102,7 @@ func TestInstanceMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if md.ProviderID != "proxmox:///pve1/1101" || md.Zone != "pve1" || md.Region != "homelab" || md.InstanceType != "4c-8g" {
+	if md.ProviderID != "proxmox://homelab/1101" || md.Zone != "pve1" || md.Region != "homelab" || md.InstanceType != "4c-8g" {
 		t.Errorf("unexpected metadata %+v", md)
 	}
 	var internal []string

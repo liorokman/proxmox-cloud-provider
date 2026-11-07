@@ -20,12 +20,14 @@
 package proxmox
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -72,6 +74,10 @@ type ClusterConfig struct {
 	InsecureTLS bool   `yaml:"insecureTLS"`
 	CACert      string `yaml:"caCert"`
 	Debug       bool   `yaml:"debug"`
+	// LabelSyncInterval is how often (in seconds) the node labels that come from
+	// the VMs (zone, instance type, tags) are brought up to date. 0 means 60,
+	// and a negative value turns the synchronization off.
+	LabelSyncInterval int `yaml:"labelSyncInterval"`
 }
 
 // New returns a new instance of the proxmox cloud provider
@@ -101,6 +107,20 @@ func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilde
 		log.Fatalf("failed to connect to proxmox: %s", err.Error())
 	}
 	p.instances = instances
+
+	if interval := labelSyncInterval(p.config.ClusterConfig); interval > 0 && clientBuilder != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-stop
+			cancel()
+		}()
+		syncer := &labelSyncer{
+			instances: instances.(*Instances),
+			client:    clientBuilder.ClientOrDie("proxmox-label-sync"),
+			interval:  interval,
+		}
+		go syncer.run(ctx)
+	}
 
 	creds, err := loadKeypair(p.config.Security)
 	if err != nil {
@@ -166,6 +186,17 @@ func (p *Provider) ProviderName() string {
 // HasClusterID returns true if a ClusterID is required and set
 func (p *Provider) HasClusterID() bool {
 	return true
+}
+
+// labelSyncInterval returns how often to synchronize node labels, 0 when it is turned off.
+func labelSyncInterval(c ClusterConfig) time.Duration {
+	switch {
+	case c.LabelSyncInterval < 0:
+		return 0
+	case c.LabelSyncInterval == 0:
+		return time.Minute
+	}
+	return time.Duration(c.LabelSyncInterval) * time.Second
 }
 
 func loadKeypair(security Security) (credentials.TransportCredentials, error) {

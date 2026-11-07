@@ -37,3 +37,4 @@ data:
          username: /var/run/secrets/ccm/proxmoxUser
          insecureTLS: {{ default "false" .Values.proxmox.insecure }}
          caCert: /var/run/secrets/ccm/proxmoxCA.crt
+         labelSyncInterval: {{ default 60 .Values.proxmox.labelSyncInterval }}
