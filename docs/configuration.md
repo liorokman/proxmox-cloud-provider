@@ -107,7 +107,10 @@ shows the common ones. Settings that are not obvious:
 | `PVE_TOKEN_NAME` | `ccm-<CLUSTER_NAME>` | Its secret is kept in `/var/lib/pve-k8s-bootstrap` |
 | `PVE_ROLE`, `PVE_NODE_ROLE` | `K8sCCM`, `K8sCCMNode` | The roles on the pool and on `/` |
 | `TAGS` | `k8s;<CLUSTER_NAME>` | Proxmox tags of the VMs (they become node labels) and the container |
-| `HA` | `no` | `yes`: HA resources and anti-affinity rules; needs 2 or more Proxmox nodes |
+| `CONTROL_PLANES` | `1` | Control plane VMs (stacked etcd). Use 1 or an odd number: 2 etcd members stop as soon as either is down. The extra ones join through `kubeadm join --control-plane` and become targets of the `apiserver` entry of the load balancer |
+| `CP_STORAGE`, `CP_NODES` | | Storage that is local to each Proxmox node for the control plane disks, and the node of each control plane (default: the cluster's nodes by name). etcd needs low fsync latency, which shared or replicated storage on slow disks doesn't give: the API server times out. Control planes on `CP_STORAGE` are not HA resources; with three of them, one per node, a node failure leaves the etcd majority standing |
+| `EXTRA_CP_VMID_START`, `EXTRA_CP_IP_START` | `CONTROL_PLANE_VMID + 50`, `NODE_IP_START + 50` | VM ID and last address octet of the second control plane, the others follow. Apart from the workers' numbers, so that adding workers doesn't renumber them |
+| `HA` | `no` | `yes`: HA resources; needs 2 or more Proxmox nodes. With 3 or more there are anti-affinity rules too (load balancer away from the control plane, workers from each other), as far as the guests still fit on the nodes left after one node fails. With 3 or more control planes, one per Proxmox node, which keeps etcd's majority through a node failure |
 | `LB_MODE` | `appliance` | Or `hookscript` |
 | `IMAGE_TAG`, `IMAGE_ARCHIVE` | | A cloud provider image other than the chart's, or one loaded from a local archive |
 

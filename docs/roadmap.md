@@ -128,7 +128,12 @@ only set when a node registers, so existing nodes keep their old ones.
   in step with the VMs (migrations, HA balancing, resizing).
 * A provider ID that the Proxmox CSI plugin understands, and its use documented (README).
 * Optional HA resources and anti-affinity rules in the bootstrap script (`HA=yes`; needs a Proxmox
-  cluster of two nodes or more, so it is untested beyond the API calls on a single node).
+  cluster of two nodes or more). Tested on a two-node cluster with a QDevice and shared NFS
+  storage: a hard power-off of the node with the load balancer took the API server down for
+  about 5 minutes (fencing about 3 minutes, then the container start). That test found that
+  strict anti-affinity rules block the recovery on two nodes, so the rules are only created on
+  three nodes or more; that the script has to load the IPVS modules on every node and follow
+  the guests with `qm` and `pct`; and that the HA step has to be last.
 
 ### P25: maybe some day, but unlikely
 

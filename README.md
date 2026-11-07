@@ -145,9 +145,33 @@ The VMs and the container of a cluster are put in a pool, `k8s-<CLUSTER_NAME>`,
 and the cluster's token (of the user `ccm-<CLUSTER_NAME>@pve`) can only see
 the guests in it. They also get the Proxmox tags `k8s` and the cluster name
 (`TAGS`, see [Proxmox tags as node labels](#proxmox-tags-and-node-labels)). With `HA=yes` on a Proxmox
-cluster of two nodes or more, the VMs and the container become HA resources, with
-anti-affinity rules that keep the load balancer container away from the control plane
-VM and the workers away from each other (when there are hosts enough).
+cluster of two nodes or more, the VMs and the container become HA resources. With three
+nodes or more, anti-affinity rules also keep the load balancer container away from the
+control plane VM and the workers away from each other, as far as they still fit on the
+nodes that remain after one node fails. Proxmox treats these rules as strict: if the
+only surviving node holds a guest that a failed guest must be kept away from, the HA
+manager does not recover it at all, so on two nodes there are no rules. The control planes are
+the exception: with three or more, one per node, so that a node failure leaves the etcd majority
+standing (the lost control plane VM then waits for its node).
+
+`CONTROL_PLANES=3` (or any odd number) adds control plane VMs to the cluster; the API server
+address stays the load balancer's. With a single control plane VM, a Proxmox node failure takes
+the API server down until the HA manager has recovered that VM. More control planes only help
+when they are on different Proxmox nodes: with two Proxmox nodes one of them holds at least
+half of the etcd members, so three Proxmox nodes are the minimum for an API server that
+survives a node failure.
+
+Put the control planes' disks on storage that is fast and local to each Proxmox node
+(`CP_STORAGE`): etcd syncs its log on every write, and on Ceph over hard disks, or on NFS, the
+sync takes seconds at times, the API server's health checks fail and writes time out. With
+`CP_STORAGE` the control planes are created on separate nodes and are not HA resources, since
+their disks are not reachable from the other nodes; etcd's own replication is their HA.
+
+HA needs storage that all the nodes can reach (shared storage, or replicated storage
+such as ZFS) for `STORAGE`, and `SNIPPET_STORAGE` and `LB_TEMPLATE_STORAGE` too, and the
+IPVS kernel modules on every node, which `up` loads. The `qm` and `pct` calls of the
+script follow the guests to the node that runs them, so `up` can be repeated after
+the HA manager moved something.
 
 `up` can be repeated: every step skips what exists already, so a failed run
 resumes where it stopped. It writes the cluster's kubeconfig to
