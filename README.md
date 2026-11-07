@@ -529,3 +529,25 @@ snapshot with `pct snapshot`) before upgrading.
 * **Metrics** on `:9100` are enabled by the new hookscript only.
 
 
+
+# Development
+
+```bash
+go build ./...
+go vet ./...
+go test ./...                       # the tests that don't need root
+scripts/test-privileged.sh devstack # also run every package as root on that host (ssh)
+```
+
+Most of the load balancer is only exercised by tests that configure IPVS in a
+private network namespace, which needs real root (the kernel does not allow it
+from a user namespace) and the `ip_vs` module. `scripts/test-privileged.sh`
+builds the test binaries here, runs them as root on the host you give it (a
+Proxmox node, or any Linux machine with `modprobe ip_vs ip_vs_rr`), and prints
+the combined coverage, without counting the generated protobuf code. Without
+root those tests skip themselves.
+
+IPVS is programmed through [github.com/cloudflare/ipvs](https://github.com/cloudflare/ipvs)
+(`internal/ipvsns` opens it inside the load balancer's network namespace). The
+load balancer used to carry a copy of `github.com/moby/ipvs`, which has not had
+a release since January 2023.

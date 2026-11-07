@@ -22,27 +22,29 @@ import (
 
 var k = koanf.New(".")
 
-func init() {
+// loadConfig reads the configuration from /etc/lbmanager and the current directory.
+func loadConfig() error {
 	log.Printf("Loading configuration...")
 	somethingLoaded := false
 	err := loadConfigFile("/etc/lbmanager/lbmanager.yaml")
 	if err == nil {
 		somethingLoaded = true
 	} else if !os.IsNotExist(err) {
-		log.Fatalf("error loading config: %v", err)
+		return fmt.Errorf("error loading config: %v", err)
 	}
 
 	err = loadConfigFile("lbmanager.yaml")
 	if err == nil {
 		somethingLoaded = true
 	} else if !os.IsNotExist(err) {
-		log.Fatalf("error loading local config: %v", err)
+		return fmt.Errorf("error loading local config: %v", err)
 	}
 
 	if !somethingLoaded {
-		log.Fatalf("No configuration found. Cowardly refusing to continue.\n")
+		return fmt.Errorf("No configuration found. Cowardly refusing to continue.")
 	}
 	log.Printf("done\n")
+	return nil
 }
 
 func loadConfigFile(configFile string) error {
@@ -78,7 +80,7 @@ func newGRPCCreds(certFile, keyFile, caFile string) (credentials.TransportCreden
 	}
 	capool := x509.NewCertPool()
 	if !capool.AppendCertsFromPEM(data) {
-		return nil, err
+		return nil, fmt.Errorf("no certificate found in %s", caFile)
 	}
 	return credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -88,37 +90,43 @@ func newGRPCCreds(certFile, keyFile, caFile string) (credentials.TransportCreden
 }
 
 func main() {
-
-	creds, err := newGRPCCreds(k.MustString("grpc.auth.cert"),
-		k.MustString("grpc.auth.key"),
-		k.MustString("grpc.auth.ca"))
-	if err != nil {
-		log.Fatalf("error initializing TLS: %v", err)
-	}
-
-	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", k.MustString("grpc.listen"), k.MustInt("grpc.port")))
-	if err != nil {
-		log.Fatalf("failed listening: %v", err)
-	}
-	lbServer, err := loadbalancer.NewServer(k)
-	if err != nil {
-		log.Fatalf("failed starting the loadbalancer manager: %v", err)
-	}
-	defer lbServer.Close()
-	if err := lbServer.Restore(); err != nil {
-		log.Fatalf("failed restoring the loadbalancer configuration: %v", err)
+	if err := loadConfig(); err != nil {
+		log.Fatalf("%v", err)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	lbServer.StartHealthChecks(ctx)
-	if err := lbServer.ServeMetrics(ctx, k.String("metrics.listen")); err != nil {
-		log.Fatalf("failed starting the metrics endpoint: %v", err)
+	if err := run(ctx, k); err != nil {
+		log.Fatalf("%v", err)
 	}
-	opts := []grpc.ServerOption{
-		grpc.Creds(creds),
+}
+
+// run starts the load balancer manager and serves requests until ctx is done.
+func run(ctx context.Context, config *koanf.Koanf) error {
+	creds, err := newGRPCCreds(config.String("grpc.auth.cert"),
+		config.String("grpc.auth.key"),
+		config.String("grpc.auth.ca"))
+	if err != nil {
+		return fmt.Errorf("error initializing TLS: %v", err)
 	}
 
-	grpcServer := grpc.NewServer(opts...)
+	lis, err := net.Listen("tcp", fmt.Sprintf("%s:%d", config.String("grpc.listen"), config.Int("grpc.port")))
+	if err != nil {
+		return fmt.Errorf("failed listening: %v", err)
+	}
+	defer lis.Close()
+	lbServer, err := loadbalancer.NewServer(config)
+	if err != nil {
+		return fmt.Errorf("failed starting the loadbalancer manager: %v", err)
+	}
+	defer lbServer.Close()
+	if err := lbServer.Restore(); err != nil {
+		return fmt.Errorf("failed restoring the loadbalancer configuration: %v", err)
+	}
+	lbServer.StartHealthChecks(ctx)
+	if err := lbServer.ServeMetrics(ctx, config.String("metrics.listen")); err != nil {
+		return fmt.Errorf("failed starting the metrics endpoint: %v", err)
+	}
+	grpcServer := grpc.NewServer(grpc.Creds(creds))
 	loadbalancer.RegisterLoadBalancerServer(grpcServer, lbServer)
 	log.Println("Listening...")
 	go func() {
@@ -135,4 +143,5 @@ func main() {
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Printf("serve: %v", err)
 	}
+	return nil
 }

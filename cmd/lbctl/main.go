@@ -20,65 +20,76 @@ import (
 	"github.com/liorokman/proxmox-cloud-provider/internal/loadbalancer"
 )
 
-var k = koanf.New(".")
-
-var (
-	clientCert = flag.String("cert", "", "filename containing the client certificate")
-	clientKey  = flag.String("key", "", "filename containing the client certificate private key")
-	caFile     = flag.String("ca", "", "filename containing the CA that can verify the server")
-
-	serverAddr = flag.String("addr", "", "server address")
-	name       = flag.String("name", "", "service name")
-	op         = flag.String("op", "addSrv", "addSrv, delSrv, addTgt, delTgt, list")
-
-	service  = flag.String("srv", "", "in {add,del}Srv - service ip, in {add,del}Tgt - target ip")
-	protocol = flag.Bool("tcp", true, "true == TCP, false == UDP")
-	dstPort  = flag.Int("dport", 8080, "destination port")
-	srcPort  = flag.Int("sport", 8080, "source port")
-)
-
-func init() {
-	err := loadConfigFile("/etc/lbmanager/lbctl.yaml")
-	if err != nil && !os.IsNotExist(err) {
-		log.Fatalf("failed loading config: %v", err)
-	}
+// options are the command line settings
+type options struct {
+	cert, key, ca string
+	addr          string
+	name          string
+	op            string
+	service       string
+	tcp           bool
+	dstPort       int
+	srcPort       int
 }
 
-func loadConfigFile(configFile string) error {
-	f := file.Provider(configFile)
-	if err := k.Load(f, yaml.Parser()); err != nil {
-		return err
+func parseFlags(args []string, output io.Writer) (*options, error) {
+	o := &options{}
+	fs := flag.NewFlagSet("lbctl", flag.ContinueOnError)
+	fs.SetOutput(output)
+	fs.StringVar(&o.cert, "cert", "", "filename containing the client certificate")
+	fs.StringVar(&o.key, "key", "", "filename containing the client certificate private key")
+	fs.StringVar(&o.ca, "ca", "", "filename containing the CA that can verify the server")
+	fs.StringVar(&o.addr, "addr", "", "server address")
+	fs.StringVar(&o.name, "name", "", "service name")
+	fs.StringVar(&o.op, "op", "addSrv", "addSrv, delSrv, addTgt, delTgt, list")
+	fs.StringVar(&o.service, "srv", "", "in {add,del}Srv - service ip, in {add,del}Tgt - target ip")
+	fs.BoolVar(&o.tcp, "tcp", true, "true == TCP, false == UDP")
+	fs.IntVar(&o.dstPort, "dport", 8080, "destination port")
+	fs.IntVar(&o.srcPort, "sport", 8080, "source port")
+	if err := fs.Parse(args); err != nil {
+		return nil, err
 	}
-	return nil
+	if o.name == "" && o.op != "list" {
+		return nil, fmt.Errorf("no loadbalancer name provided.")
+	}
+	return o, nil
 }
 
-func loadKeypair() (credentials.TransportCredentials, error) {
-	if *clientKey == "" {
-		*clientKey = k.String("auth.clientKey")
+func loadConfigFile(k *koanf.Koanf, configFile string) error {
+	return k.Load(file.Provider(configFile), yaml.Parser())
+}
+
+// loadKeypair builds the client credentials from the flags, falling back to
+// the "auth" section of the configuration.
+func loadKeypair(o *options, k *koanf.Koanf) (credentials.TransportCredentials, error) {
+	keyFile, certFile, caFile := o.key, o.cert, o.ca
+	if keyFile == "" {
+		keyFile = k.String("auth.clientKey")
 	}
-	if *clientCert == "" {
-		*clientCert = k.String("auth.clientCert")
+	if certFile == "" {
+		certFile = k.String("auth.clientCert")
 	}
-	if *clientKey == "" {
-		clientKey = clientCert
+	if keyFile == "" {
+		// The key may be in the same file as the certificate
+		keyFile = certFile
 	}
-	if *caFile == "" {
-		*caFile = k.String("auth.caFile")
+	if caFile == "" {
+		caFile = k.String("auth.caFile")
 	}
-	if *clientKey == "" || *clientCert == "" || *caFile == "" {
+	if keyFile == "" || certFile == "" || caFile == "" {
 		return nil, fmt.Errorf("no mTLS configuration found")
 	}
-	cert, err := tls.LoadX509KeyPair(*clientCert, *clientKey)
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		return nil, err
 	}
-	ca, err := os.ReadFile(*caFile)
+	ca, err := os.ReadFile(caFile)
 	if err != nil {
 		return nil, err
 	}
 	capool := x509.NewCertPool()
 	if !capool.AppendCertsFromPEM(ca) {
-		return nil, err
+		return nil, fmt.Errorf("no certificate found in %s", caFile)
 	}
 	return credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -86,101 +97,79 @@ func loadKeypair() (credentials.TransportCredentials, error) {
 	}), nil
 }
 
-func main() {
-	flag.Parse()
-
-	if *name == "" && *op != "list" {
-		log.Fatal("no loadbalancer name provided.")
-	}
-
-	creds, err := loadKeypair()
+// run connects to the server and performs the requested operation.
+func run(ctx context.Context, o *options, k *koanf.Koanf) error {
+	creds, err := loadKeypair(o, k)
 	if err != nil {
-		log.Fatalf("error loading mTLS configuration: %+v", err)
+		return fmt.Errorf("error loading mTLS configuration: %+v", err)
 	}
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(creds),
+	addr := o.addr
+	if addr == "" {
+		addr = k.String("addr")
 	}
-	if *serverAddr == "" {
-		*serverAddr = k.String("addr")
-	}
-	conn, err := grpc.Dial(*serverAddr, opts...)
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		log.Fatalf("error connecting to lbmanager: %+v", err)
+		return fmt.Errorf("error connecting to lbmanager: %+v", err)
 	}
 	defer conn.Close()
+	return execute(ctx, loadbalancer.NewLoadBalancerClient(conn), o)
+}
 
+// execute performs the operation on the server.
+func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *options) error {
 	var p loadbalancer.Protocol = loadbalancer.Protocol_TCP
-	if !*protocol {
+	if !o.tcp {
 		p = loadbalancer.Protocol_UDP
 	}
-
-	client := loadbalancer.NewLoadBalancerClient(conn)
-
-	switch *op {
-	case "addSrv":
-		clb := &loadbalancer.CreateLoadBalancer{
-			Name:   *name,
-			IpAddr: service,
+	reportResult := func(ret *loadbalancer.Error) {
+		if len(ret.Message) != 0 {
+			log.Printf("Message from server: %s", ret.Message)
+		} else {
+			log.Printf("Success!")
 		}
-		lbInfo, err := client.Create(context.Background(), clb)
+	}
+
+	switch o.op {
+	case "addSrv":
+		lbInfo, err := client.Create(ctx, &loadbalancer.CreateLoadBalancer{Name: o.name, IpAddr: &o.service})
 		if err != nil {
-			log.Fatalf("Error during create: %s", err.Error())
+			return fmt.Errorf("Error during create: %s", err.Error())
 		}
 		log.Printf("LBInfo: %+v\n", lbInfo)
 
 	case "delSrv":
-		ret, err := client.Delete(context.Background(), &loadbalancer.LoadBalancerName{
-			Name: *name,
-		})
+		ret, err := client.Delete(ctx, &loadbalancer.LoadBalancerName{Name: o.name})
 		if err != nil {
-			log.Fatalf("Error during delete: %s", err.Error())
+			return fmt.Errorf("Error during delete: %s", err.Error())
 		}
-		if len(ret.Message) != 0 {
-			log.Printf("Message from server: %s", ret.Message)
-		} else {
-			log.Printf("Success!")
-		}
+		reportResult(ret)
+
 	case "addTgt":
-		ret, err := client.AddTarget(context.Background(), &loadbalancer.AddTargetRequest{
-			LbName:  *name,
-			SrcPort: int32(*srcPort),
-			Target: &loadbalancer.Target{
-				DstIP:    *service,
-				DstPort:  int32(*dstPort),
-				Protocol: p,
-			},
+		ret, err := client.AddTarget(ctx, &loadbalancer.AddTargetRequest{
+			LbName:  o.name,
+			SrcPort: int32(o.srcPort),
+			Target:  &loadbalancer.Target{DstIP: o.service, DstPort: int32(o.dstPort), Protocol: p},
 		})
 		if err != nil {
-			log.Fatalf("Error adding destination: %s", err.Error())
+			return fmt.Errorf("Error adding destination: %s", err.Error())
 		}
-		if len(ret.Message) != 0 {
-			log.Printf("Message from server: %s", ret.Message)
-		} else {
-			log.Printf("Success!")
-		}
+		reportResult(ret)
+
 	case "delTgt":
-		ret, err := client.DelTarget(context.Background(), &loadbalancer.DelTargetRequest{
-			LbName:  *name,
-			SrcPort: int32(*srcPort),
-			Target: &loadbalancer.Target{
-				DstIP:    *service,
-				DstPort:  int32(*dstPort),
-				Protocol: p,
-			},
+		ret, err := client.DelTarget(ctx, &loadbalancer.DelTargetRequest{
+			LbName:  o.name,
+			SrcPort: int32(o.srcPort),
+			Target:  &loadbalancer.Target{DstIP: o.service, DstPort: int32(o.dstPort), Protocol: p},
 		})
 		if err != nil {
-			log.Fatalf("Error deleting destination: %s", err.Error())
+			return fmt.Errorf("Error deleting destination: %s", err.Error())
 		}
-		if len(ret.Message) != 0 {
-			log.Printf("Message from server: %s", ret.Message)
-		} else {
-			log.Printf("Success!")
-		}
+		reportResult(ret)
 
 	case "list":
-		stream, err := client.GetLoadBalancers(context.Background(), &emptypb.Empty{})
+		stream, err := client.GetLoadBalancers(ctx, &emptypb.Empty{})
 		if err != nil {
-			log.Fatalf("Failed to list load balancers: %s", err.Error())
+			return fmt.Errorf("Failed to list load balancers: %s", err.Error())
 		}
 		for {
 			lb, err := stream.Recv()
@@ -188,11 +177,29 @@ func main() {
 				break
 			}
 			if err != nil {
-				log.Fatalf("Error listing load balancers %v", err)
+				return fmt.Errorf("Error listing load balancers %v", err)
 			}
 			log.Println(lb)
 		}
 	default:
-		log.Fatalf("Unknown operation %s", *op)
+		return fmt.Errorf("Unknown operation %s", o.op)
+	}
+	return nil
+}
+
+func main() {
+	k := koanf.New(".")
+	if err := loadConfigFile(k, "/etc/lbmanager/lbctl.yaml"); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("failed loading config: %v", err)
+	}
+	o, err := parseFlags(os.Args[1:], os.Stderr)
+	if err != nil {
+		if err == flag.ErrHelp {
+			os.Exit(0)
+		}
+		log.Fatal(err)
+	}
+	if err := run(context.Background(), o, k); err != nil {
+		log.Fatal(err)
 	}
 }

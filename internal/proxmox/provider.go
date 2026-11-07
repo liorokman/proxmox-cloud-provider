@@ -163,7 +163,7 @@ func loadKeypair(security Security) (credentials.TransportCredentials, error) {
 	}
 	capool := x509.NewCertPool()
 	if !capool.AppendCertsFromPEM(ca) {
-		return nil, err
+		return nil, fmt.Errorf("no certificate found in %s", security.CAFile)
 	}
 	return credentials.NewTLS(&tls.Config{
 		Certificates: []tls.Certificate{cert},
