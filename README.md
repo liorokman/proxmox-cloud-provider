@@ -73,20 +73,35 @@ using this cloud controller provider:
 
    The cloud provider only reads information about virtual machines (and asks
    their QEMU guest agent for the network addresses), so it needs a read-only
-   role. The following creates a dedicated user, role and
-   token (with privilege separation turned off, so that the token inherits the
-   user's permissions):
+   role. To keep one cluster from seeing the VMs of another, put the VMs and
+   the load balancer container of the cluster in a Proxmox
+   [resource pool](https://pve.proxmox.com/pve-docs/chapter-pveum.html#pveum_pools),
+   and give the token its role on that pool only. `Sys.Audit` is also needed on
+   `/` for the cluster name and the node status; it doesn't give access to
+   any VM. The following creates the pool (`k8s-red` for a cluster called
+   `red`), a dedicated user, the roles and a token (with privilege separation
+   turned off, so that the token inherits the user's permissions):
 
    ```bash
-   pveum role add K8sCCM -privs "VM.Audit Sys.Audit VM.GuestAgent.Audit"
-   pveum user add ccm@pve --comment "Kubernetes cloud controller"
-   pveum acl modify / --users ccm@pve --roles K8sCCM
-   pveum user token add ccm@pve ccm --privsep 0
+   pveum role add K8sCCM -privs "VM.Audit VM.GuestAgent.Audit"
+   pveum role add K8sCCMNode -privs "Sys.Audit"
+   pvesh create /pools --poolid k8s-red
+   pvesh set /pools/k8s-red --vms 1100,1101,1102     # the cluster's VMs and container
+   pveum user add ccm-red@pve --comment "Kubernetes cloud controller of red"
+   pveum acl modify /pool/k8s-red --users ccm-red@pve --roles K8sCCM
+   pveum acl modify / --users ccm-red@pve --roles K8sCCMNode
+   pveum user token add ccm-red@pve ccm --privsep 0
    ```
- 
+
+   (Or create the pool first and use `--pool k8s-red` when cloning the VMs
+   and creating the container.) Without a pool the cloud provider falls back
+   to finding the node's VM by its name, among every VM it can see, and
+   refuses to guess when two VMs have that name; a token with the roles on `/`
+   still works.
+
    Set `PROXMOX_API_TOKEN` to the generated token value, and set
    `PROXMOX_API_USERNAME` to the full token ID. In this example, the username
-   would be `ccm@pve!ccm`.
+   would be `ccm-red@pve!ccm`.
 
 # Creating a Kubernetes Cluster
 
@@ -108,6 +123,14 @@ scripts/bootstrap-cluster.sh -c cluster.env up
 scripts/bootstrap-cluster.sh -c cluster.env status
 scripts/bootstrap-cluster.sh -c cluster.env destroy --yes
 ```
+
+The VMs and the container of a cluster are put in a pool, `k8s-<CLUSTER_NAME>`,
+and the cluster's token (of the user `ccm-<CLUSTER_NAME>@pve`) can only see
+the guests in it. They also get the Proxmox tags `k8s` and the cluster name
+(`TAGS`, see [Proxmox tags as node labels](#proxmox-tags-and-node-labels)). With `HA=yes` on a Proxmox
+cluster of two nodes or more, the VMs and the container become HA resources, with
+anti-affinity rules that keep the load balancer container away from the control plane
+VM and the workers away from each other (when there are hosts enough).
 
 `up` can be repeated: every step skips what exists already, so a failed run
 resumes where it stopped. It writes the cluster's kubeconfig to
@@ -434,6 +457,122 @@ kubectl get svc web
 For `externalTrafficPolicy: Local` Services, the load balancer sends traffic
 only to nodes whose `healthCheckNodePort` answers `/healthz` successfully.
 
+## Proxmox tags and node labels
+
+The cloud provider sets these labels on every node that is backed by a Proxmox VM:
+
+| Label | Value |
+|---|---|
+| `topology.kubernetes.io/region` | the name of the Proxmox cluster |
+| `topology.kubernetes.io/zone` | the Proxmox node that runs the VM |
+| `node.kubernetes.io/instance-type` | the size of the VM, for example `4c-8g` |
+| `tag.proxmox.liorokman.github.io/<tag>` | `true`, for each [tag](https://pve.proxmox.com/pve-docs/chapter-qm.html#qm_options) of the VM |
+
+Tag a VM with `qm set 1102 --tags "gpu;fast-disk"` and the node gets the labels
+`tag.proxmox.liorokman.github.io/gpu=true` and `.../fast-disk=true`, which `nodeSelector`
+and affinity rules can use. Tags that are not valid label names (for example with a `+`)
+are ignored.
+
+Kubernetes sets labels from the cloud provider only when a node registers. A VM that moves
+to another Proxmox node (a migration, or the HA manager balancing the load), is resized,
+or is tagged later would keep stale labels, so the cloud provider also compares
+all nodes with their VMs every `proxmox.labelSyncInterval` seconds (default 60, set a negative
+value to turn it off) and updates the labels. Only the labels in the table are touched; labels
+you add yourself are kept, and a tag that is removed from the VM loses its label.
+
+The provider ID of new nodes is `proxmox://<cluster name>/<VM ID>`. Nodes that registered
+with an earlier version have `proxmox:///<Proxmox node>/<VM ID>`, which is still understood
+(a node keeps its provider ID for life).
+
+# Persistent volumes: the Proxmox CSI plugin
+
+Kubernetes volumes backed by Proxmox storage (LVM, LVM-thin, ZFS, directory, Ceph, NFS)
+come from [sergelogvinov/proxmox-csi-plugin](https://github.com/sergelogvinov/proxmox-csi-plugin),
+which this project doesn't include. It works with clusters made with this project, because the
+cloud provider sets what the plugin needs on the nodes: the `topology.kubernetes.io/region` label (the
+Proxmox cluster name), the `topology.kubernetes.io/zone` label (the Proxmox node), and a provider ID of the form
+`proxmox://<cluster name>/<VM ID>`. Tested with plugin v0.22.0 (chart 0.5.15) on Proxmox VE 9.2 and
+Kubernetes 1.37: dynamic provisioning on an LVM storage, a pod that moves to another worker and
+finds its data, online expansion, and deleting the claim removes the disk.
+
+The plugin attaches the volumes to the VMs as extra SCSI disks, so the VMs need the
+`virtio-scsi-single` (or `virtio-scsi-pci`) SCSI controller, which the VMs made by the bootstrap script have. Local storage
+(LVM, ZFS, ...) is bound to one Proxmox node: a pod can only move between VMs on that node. Shared storage
+(Ceph, NFS) has no such limit.
+
+1. Check the region the cloud provider chose; it goes into the plugin's configuration.
+
+   ```bash
+   kubectl get nodes -L topology.kubernetes.io/region,topology.kubernetes.io/zone
+   ```
+
+   A Proxmox host that is not part of a Proxmox cluster has no cluster name, and its region is `proxmox`.
+   Nodes that registered with v0.3.0 or earlier (a provider ID of the form `proxmox:///<node>/<VM ID>`)
+   work too (tested): the plugin logs "failed to get proxmox VMID from ProviderID" and finds the VM by
+   the node's name, which is the VM's name. The region label is what has to match.
+
+1. Create a Proxmox user for the plugin, with a role that only works on the cluster's pool and
+   on the storage the volumes are created in (`vms` here). The plugin's documentation grants the
+   role on `/`, which lets it attach disks to every VM.
+
+   ```bash
+   pveum role add K8sCSI -privs "VM.Audit VM.Config.Disk Datastore.Allocate Datastore.AllocateSpace Datastore.Audit"
+   pveum user add csi-red@pve --comment "Proxmox CSI of red"
+   pveum acl modify /pool/k8s-red --users csi-red@pve --roles K8sCSI
+   pveum acl modify /storage/vms --users csi-red@pve --roles K8sCSI
+   pveum user token add csi-red@pve csi --privsep 0
+   ```
+
+   The volumes show up as disks of a VM with the number 9999 (the plugin's `controllerVMID`), which must not
+   be a real VM.
+
+1. Install the plugin. The namespace needs the `privileged` Pod Security level, and the plugin takes the
+   token and the region from its Helm values:
+
+   ```bash
+   cat > proxmox-csi.yaml <<EOF
+   config:
+     clusters:
+       - url: https://$PROXMOX_HOSTNAME:8006/api2/json
+         insecure: false            # see the note below
+         token_id: "csi-red@pve!csi"
+         token_secret: "<the token value>"
+         region: <the region of the nodes>
+   storageClass:
+     - name: proxmox-lvm
+       storage: vms
+       reclaimPolicy: Delete
+       fstype: ext4
+       cache: writethrough
+   EOF
+   kubectl create ns csi-proxmox
+   kubectl label ns csi-proxmox pod-security.kubernetes.io/enforce=privileged
+   helm upgrade -i -n csi-proxmox -f proxmox-csi.yaml proxmox-csi-plugin \
+        oci://ghcr.io/sergelogvinov/charts/proxmox-csi-plugin
+   ```
+
+   > Note: the plugin can't be given a CA certificate. With the Proxmox certificate from the cluster's own CA
+   > (`/etc/pve/pve-root-ca.pem`, which the cloud provider gets in `proxmox.caCert`), set `insecure: true`
+   > (the token is then sent to whatever answers at that address), or install a certificate on Proxmox that
+   > the plugin image already trusts (for example from Let's Encrypt, through the ACME support of Proxmox).
+
+1. Use it:
+
+   ```bash
+   kubectl apply -f - <<EOF
+   apiVersion: v1
+   kind: PersistentVolumeClaim
+   metadata: {name: data}
+   spec:
+     accessModes: [ReadWriteOnce]
+     storageClassName: proxmox-lvm
+     resources: {requests: {storage: 2Gi}}
+   EOF
+   ```
+
+   The storage class uses `WaitForFirstConsumer`: the disk is created when a pod that uses the claim is scheduled, on
+   the Proxmox node of the worker that gets it.
+
 # Upgrading
 
 The cloud provider (in the cluster) and `lbmanager` (in the container) talk
@@ -444,8 +583,8 @@ the chart is upgraded. Load balancers and their state are kept in
 `/var/lib/lbmanager` in the container and survive the upgrade.
 
 1. Read the release notes for changes that need manual steps. For the changes
-   since v0.2.0 see "Notes for upgrading from v0.2.0", and since v0.1.0 see
-   "Notes for upgrading from v0.1.0", below.
+   since v0.3.0 see "Notes for upgrading from v0.3.0", since v0.2.0 see "Notes for upgrading from v0.2.0",
+   and since v0.1.0 see "Notes for upgrading from v0.1.0", below.
 
 1. Upgrade `lbmanager` and `lbctl`.
 
@@ -494,6 +633,26 @@ To roll back, put the previous binaries and hookscript back, reboot the
 container, and run `helm rollback proxmox-ccm`. Rolling back has not been
 tested across versions; back up `/var/lib/lbmanager` (or take a container
 snapshot with `pct snapshot`) before upgrading.
+
+## Notes for upgrading from v0.3.0
+
+The API between the cloud provider and `lbmanager` is unchanged, so the order of the upgrade
+doesn't matter. Nothing needs to be done by hand.
+
+* **Node labels follow the VM:** the zone, region and instance type labels are kept up
+  to date (every `proxmox.labelSyncInterval` seconds), and the VM's Proxmox tags become
+  labels. See "Proxmox tags and node labels". The cloud provider's cluster role already allows
+  patching nodes.
+* **Provider ID:** new nodes get `proxmox://<cluster name>/<VM ID>` (the form the
+  Proxmox CSI plugin expects). Existing nodes keep theirs.
+* **Ambiguous names:** when a node has no provider ID and several VMs have its name, the
+  cloud provider now reports an error instead of choosing one.
+* **Scoped token (optional):** the token can be restricted to the VMs of the cluster, see
+  "Prepare an API token". Existing tokens with the roles on `/` keep working.
+* **Bootstrap script:** new clusters get a pool and their own Proxmox user,
+  `ccm-<CLUSTER_NAME>@pve`, instead of the shared `ccm@pve`. Set `PVE_USER=ccm@pve` in the settings
+  file of a cluster that was built before, or its next `up` creates a new user and token.
+  `up` puts the existing VMs in the new pool.
 
 ## Notes for upgrading from v0.2.0
 

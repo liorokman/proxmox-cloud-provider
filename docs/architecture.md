@@ -32,7 +32,8 @@ that share one binary only at the Kubernetes side:
 resources, first by the `providerID` (`proxmox:///<pve node>/<vmid>`), and
 otherwise by the VM name. It reports:
 
-* the provider ID, the Proxmox node as the zone, the Proxmox cluster as the
+* the provider ID (`proxmox://<cluster name>/<vmid>`, the form of the Proxmox CSI
+  plugin; the older `proxmox:///<pve node>/<vmid>` is still read), the Proxmox node as the zone, the Proxmox cluster as the
   region, and an instance type derived from the VM's size (for example
   `4c-8g`). Labels are only set when a node registers;
 * the node addresses: the IPv4 addresses that the QEMU guest agent reports on
@@ -42,12 +43,23 @@ otherwise by the VM name. It reports:
   settings are used. The VM's name is always the hostname;
 * whether the VM exists and whether it is running.
 
+Labels are set by the Kubernetes cloud node controller only when a node registers.
+`internal/proxmox/labels.go` runs a loop in the cloud provider (`labelSyncInterval`) that
+compares every node that has a `proxmox:` provider ID with the cluster resources and patches
+the zone, region and instance type labels (both the GA and the beta ones, since the cloud node
+controller treats the beta label as the source of truth) and the labels made from the
+VM's tags (`tag.proxmox.liorokman.github.io/<tag>`), so a migrated or resized VM is reflected
+within a minute. Only these keys are touched. A node name that several VMs have, without
+a provider ID, is an error instead of a guess.
+
 `InstanceExists` only returns `false` when the VM does not exist. Any other
 failure (for example, the Proxmox API being unreachable) is returned as an
 error, since a `false` answer makes Kubernetes delete the Node object.
 
 The Proxmox client is [luthermonson/go-proxmox](https://github.com/luthermonson/go-proxmox).
-The API token only needs the `VM.Audit`, `Sys.Audit` and `VM.GuestAgent.Audit` privileges.
+The API token only needs the `VM.Audit` and `VM.GuestAgent.Audit` privileges, on the
+resource pool of the cluster (so that it cannot see the other clusters' VMs), and `Sys.Audit` on `/`
+(cluster name and node status, no access to any VM).
 The Helm chart gives the cloud provider a narrow cluster role (nodes, services
 and events, plus leader election and delegated authentication) instead of
 `cluster-admin`.

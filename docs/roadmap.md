@@ -121,6 +121,15 @@ only set when a node registers, so existing nodes keep their old ones.
 15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, one control
     plane node). Cluster API integration is still open. **L**
 
+### Done after v0.3.0
+
+* Resource pool per cluster, a token that only sees its pool, and a user per cluster (bootstrap script).
+* Proxmox tags as node labels, and a loop that keeps the zone, region, instance type and tag labels
+  in step with the VMs (migrations, HA balancing, resizing).
+* A provider ID that the Proxmox CSI plugin understands, and its use documented (README).
+* Optional HA resources and anti-affinity rules in the bootstrap script (`HA=yes`; needs a Proxmox
+  cluster of two nodes or more, so it is untested beyond the API calls on a single node).
+
 ### P25: maybe some day, but unlikely
 
 16. CI on GitHub: build, vet, unit tests, the privileged IPVS test, and
