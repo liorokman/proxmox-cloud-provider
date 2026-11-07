@@ -245,7 +245,7 @@ section, plus a volume for the state (the CA and the database), then give it its
 settings and start the units:
 
 ```bash
-pct create 1100 local:vztmpl/lbmanager-v0.3.0_amd64.tar.zst -unprivileged 0 -pool k8s-red \
+pct create 1100 local:vztmpl/lbmanager-v0.3.1_amd64.tar.zst -unprivileged 0 -pool k8s-red \
     -hostname k8slb1 -memory 512 -features nesting=1 -rootfs $STORAGE:4 \
     -mp0 $STORAGE:1,mp=/var/lib/lbstate,backup=1 \
     -net0 name=eth0,bridge=vmbr0,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW \
@@ -696,6 +696,16 @@ doesn't matter. Nothing needs to be done by hand.
   `ccm-<CLUSTER_NAME>@pve`, instead of the shared `ccm@pve`. Set `PVE_USER=ccm@pve` in the settings
   file of a cluster that was built before, or its next `up` creates a new user and token.
   `up` puts the existing VMs in the new pool.
+* **Bootstrap script on several Proxmox nodes:** `qm` and `pct` follow the guests to the node that
+  runs them, the IPVS modules are loaded on every node, the nodes that joined the Proxmox cluster
+  later are added to the peers of the VXLAN zone, and the HA step runs last. New settings:
+  `CONTROL_PLANES` (more than one control plane), `CP_STORAGE` and `CP_NODES` (control plane disks
+  on storage that is local to each node, see "Quick start: the bootstrap script"). Anti-affinity rules are only
+  created where recovery after a node failure still works. Nothing changes for a cluster that was
+  built before.
+* **One Proxmox endpoint:** the cloud provider talks to the single `proxmox.apiURL`. While that node
+  is down it can't start, update labels or manage load balancers. Point it at a node that is up, or
+  upgrade the release (see the roadmap).
 
 ## Notes for upgrading from v0.2.0
 

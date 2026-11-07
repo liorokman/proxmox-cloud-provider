@@ -118,10 +118,10 @@ only set when a node registers, so existing nodes keep their old ones.
 ### P3: nice to have
 
 14. IPv6 and dual-stack. **M–L**
-15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, one control
-    plane node). Cluster API integration is still open. **L**
+15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, with several
+    control planes and Proxmox nodes since v0.3.1). Cluster API integration is still open. **L**
 
-### Done after v0.3.0
+### Done in v0.3.1
 
 * Resource pool per cluster, a token that only sees its pool, and a user per cluster (bootstrap script).
 * Proxmox tags as node labels, and a loop that keeps the zone, region, instance type and tag labels
@@ -134,6 +134,12 @@ only set when a node registers, so existing nodes keep their old ones.
   strict anti-affinity rules block the recovery on two nodes, so the rules are only created on
   three nodes or more; that the script has to load the IPVS modules on every node and follow
   the guests with `qm` and `pct`; and that the HA step has to be last.
+* Several control planes (`CONTROL_PLANES`) and control plane disks on node local storage
+  (`CP_STORAGE`). Tested on a three node cluster with three control planes, one per node. That test
+  also showed that etcd needs a fast disk: on Ceph over hard disks, or on NFS, the sync times reach
+  seconds, the API server's health checks fail and its writes time out.
+* Known gap: the cloud provider has one Proxmox endpoint, so it stops working while that node is
+  down (a list of endpoints with failover is open). **S–M**
 
 ### P25: maybe some day, but unlikely
 
