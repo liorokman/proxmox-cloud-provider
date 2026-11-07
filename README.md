@@ -551,3 +551,9 @@ IPVS is programmed through [github.com/cloudflare/ipvs](https://github.com/cloud
 (`internal/ipvsns` opens it inside the load balancer's network namespace). The
 load balancer used to carry a copy of `github.com/moby/ipvs`, which has not had
 a release since January 2023.
+
+# License
+
+Apache License, Version 2.0, see [LICENSE.txt](LICENSE.txt). The copyright of
+the original work is held by Lior Okman. Files that contain material from other
+projects keep those projects' notices; see [NOTICE](NOTICE).

@@ -1,0 +1,30 @@
+Proxmox Cloud Controller Provider
+Copyright 2023-2026 Lior Okman
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE.txt).
+Every source file carries its own copyright notice. Material that comes from
+other projects keeps the notice of its authors:
+
+* main.go is derived from the cloud controller manager sample of Kubernetes
+  (k8s.io/cloud-provider/sample/basic_main.go).
+  Copyright The Kubernetes Authors, Apache License, Version 2.0.
+
+* Some of the comments in internal/proxmox/provider.go, instance.go and
+  loadbalancer.go are taken from the interface documentation of
+  k8s.io/cloud-provider. Copyright The Kubernetes Authors, Apache License,
+  Version 2.0.
+
+* The configuration reload in cmd/lbmanager/main.go follows the example in the
+  documentation of koanf (github.com/knadh/koanf).
+  Copyright (c) 2019 Kailash Nadh, MIT License.
+
+* Parts of the Helm chart (chart/.helmignore, Chart.yaml, values.yaml,
+  templates/_helpers.tpl, serviceaccount.yaml and daemonset.yaml) are based on
+  the chart scaffold created by `helm create`.
+  Copyright The Helm Authors, Apache License, Version 2.0.
+
+Dependencies are not copied into this repository, and keep their own licenses.
+The IPVS client is github.com/cloudflare/ipvs (BSD 3-Clause License,
+Copyright (c) 2018, Cloudflare). Until it replaced it, the repository contained
+a copy of github.com/moby/ipvs (Apache License, Version 2.0, Copyright 2015
+Docker, Inc.), which was removed.
