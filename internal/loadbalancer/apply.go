@@ -119,7 +119,7 @@ func (l *loadBalancerServer) applyPort(lb *LoadBalancerInformation, port int32, 
 	if len(kept) == 0 {
 		// The service has no destinations left; remove it
 		for p := range protocols {
-			if err := l.ipvsHandle.DelService(toIPVSService(lb, port, p)); err != nil {
+			if err := l.ipvsHandle.RemoveService(toIPVSService(lb, port, p)); err != nil {
 				log.Printf("apply %s: removing the ipvs service for port %d: %v", lb.Name, port, err)
 			}
 		}
@@ -146,5 +146,5 @@ func (l *loadBalancerServer) unmapTarget(lb *LoadBalancerInformation, port int32
 	if err != nil {
 		return err
 	}
-	return l.ipvsHandle.DelDestination(toIPVSService(lb, port, t.Protocol), dest)
+	return l.ipvsHandle.RemoveDestination(toIPVSService(lb, port, t.Protocol), dest)
 }

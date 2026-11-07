@@ -6,15 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/vishvananda/netns"
 
-	"github.com/liorokman/proxmox-cloud-provider/internal/ipvs"
+	"github.com/cloudflare/ipvs"
 )
 
 // Health checking.
@@ -282,24 +282,25 @@ func (l *loadBalancerServer) setWeight(lb *LoadBalancerInformation, port int32, 
 	if err != nil {
 		return err
 	}
-	dest.Weight = l.weightFor(t)
+	dest.Weight = uint32(l.weightFor(t))
 	return l.ipvsHandle.UpdateDestination(toIPVSService(lb, port, t.Protocol), dest)
 }
 
-func toIPVSDestination(t *Target) (*ipvs.Destination, error) {
-	ip := net.ParseIP(t.DstIP)
-	if ip == nil {
-		return nil, fmt.Errorf("invalid target address %q", t.DstIP)
+func toIPVSDestination(t *Target) (ipvs.Destination, error) {
+	ip, err := netip.ParseAddr(t.DstIP)
+	if err != nil {
+		return ipvs.Destination{}, fmt.Errorf("invalid target address %q", t.DstIP)
 	}
-	var fam uint16 = syscall.AF_INET
-	if ip.To4() == nil {
-		fam = syscall.AF_INET6
+	ip = ip.Unmap()
+	fam := ipvs.INET
+	if ip.Is6() {
+		fam = ipvs.INET6
 	}
-	return &ipvs.Destination{
-		Address:         ip,
-		Port:            uint16(t.DstPort),
-		ConnectionFlags: ipvs.ConnFwdMasq,
-		AddressFamily:   fam,
-		Weight:          1,
+	return ipvs.Destination{
+		Address:   ip,
+		Port:      uint16(t.DstPort),
+		FwdMethod: ipvs.Masquerade,
+		Family:    fam,
+		Weight:    1,
 	}, nil
 }

@@ -4,31 +4,15 @@ import (
 	"context"
 	"testing"
 
-	"github.com/knadh/koanf/parsers/yaml"
-	"github.com/knadh/koanf/providers/file"
 	"github.com/knadh/koanf/v2"
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvsns"
 	"github.com/vishvananda/netlink"
-	"github.com/vishvananda/netns"
 )
 
-// TestLoadBalancerLifecycle needs root, the ip_vs kernel modules and a network
-// namespace with the interface named in lbmanager.yaml:
-//
-//	modprobe ip_vs ip_vs_rr
-//	ip netns add LB && ip -n LB link add dummy0 type dummy && ip -n LB link set dummy0 up
+// TestLoadBalancerLifecycle needs root and the ip_vs kernel modules
+// (modprobe ip_vs ip_vs_rr). It creates its own network namespace.
 func TestLoadBalancerLifecycle(t *testing.T) {
-	k := koanf.New(".")
-	if err := k.Load(file.Provider("../../lbmanager.yaml"), yaml.Parser()); err != nil {
-		t.Fatal(err)
-	}
-	ns, err := netns.GetFromName(k.String("loadbalancer.namespace"))
-	if err != nil {
-		t.Skipf("network namespace %q is not available: %v", k.String("loadbalancer.namespace"), err)
-	}
-	ns.Close()
-	if err := k.Set("dbDir", t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	k := testConfig(t)
 
 	lbServer, err := NewServer(k)
 	if err != nil {
@@ -74,16 +58,11 @@ func TestLoadBalancerLifecycle(t *testing.T) {
 
 func newTestServer(t *testing.T) Intf {
 	t.Helper()
-	k := koanf.New(".")
-	if err := k.Load(file.Provider("../../lbmanager.yaml"), yaml.Parser()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := netns.GetFromName(k.String("loadbalancer.namespace")); err != nil {
-		t.Skipf("network namespace not available: %v", err)
-	}
-	if err := k.Set("dbDir", t.TempDir()); err != nil {
-		t.Fatal(err)
-	}
+	return newTestServerWith(testConfig(t), t)
+}
+
+func newTestServerWith(k *koanf.Koanf, t *testing.T) Intf {
+	t.Helper()
 	s, err := NewServer(k)
 	if err != nil {
 		t.Skipf("cannot create the server (needs root and ip_vs): %v", err)
@@ -230,7 +209,7 @@ func TestApplyConverges(t *testing.T) {
 	if len(res.Info.Targets) != 2 || res.Info.Targets[8080] != nil {
 		t.Errorf("stored state: %+v", res.Info.Targets)
 	}
-	if svcs, _ := l.ipvsHandle.GetServices(); len(svcs) != 2 {
+	if svcs, _ := ipvsns.Services(l.ipvsHandle); len(svcs) != 2 {
 		t.Errorf("expected 2 ipvs services, got %d", len(svcs))
 	}
 	// The address can't be changed
@@ -242,7 +221,7 @@ func TestApplyConverges(t *testing.T) {
 	if err != nil || len(res.Info.Targets) != 0 {
 		t.Fatalf("%v %+v", err, res)
 	}
-	if svcs, _ := l.ipvsHandle.GetServices(); len(svcs) != 0 {
+	if svcs, _ := ipvsns.Services(l.ipvsHandle); len(svcs) != 0 {
 		t.Errorf("expected no ipvs services, got %d", len(svcs))
 	}
 }

@@ -3,6 +3,7 @@ package loadbalancer
 import (
 	"context"
 	"fmt"
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvsns"
 	"io"
 	"log"
 	"net"
@@ -71,15 +72,15 @@ func (l *loadBalancerServer) WriteMetrics(w io.Writer) {
 func (l *loadBalancerServer) serviceMetrics(m *metricWriter, lb *LoadBalancerInformation, port int32, proto Protocol) {
 	srv := toIPVSService(lb, port, proto)
 	base := []string{"loadbalancer", lb.Name, "vip", lb.IpAddr, "port", fmt.Sprint(port), "protocol", proto.String()}
-	if cur, err := l.ipvsHandle.GetService(srv); err == nil {
-		st := cur.Stats
+	if cur, err := l.ipvsHandle.Service(srv); err == nil {
+		st := cur.Stats64
 		m.sample("lbmanager_service_connections_total", "counter", "Connections accepted by the virtual service.", st.Connections, base...)
-		m.sample("lbmanager_service_packets_in_total", "counter", "Packets received by the virtual service.", st.PacketsIn, base...)
-		m.sample("lbmanager_service_packets_out_total", "counter", "Packets sent by the virtual service.", st.PacketsOut, base...)
-		m.sample("lbmanager_service_bytes_in_total", "counter", "Bytes received by the virtual service.", st.BytesIn, base...)
-		m.sample("lbmanager_service_bytes_out_total", "counter", "Bytes sent by the virtual service.", st.BytesOut, base...)
+		m.sample("lbmanager_service_packets_in_total", "counter", "Packets received by the virtual service.", st.IncomingPackets, base...)
+		m.sample("lbmanager_service_packets_out_total", "counter", "Packets sent by the virtual service.", st.OutgoingPackets, base...)
+		m.sample("lbmanager_service_bytes_in_total", "counter", "Bytes received by the virtual service.", st.IncomingBytes, base...)
+		m.sample("lbmanager_service_bytes_out_total", "counter", "Bytes sent by the virtual service.", st.OutgoingBytes, base...)
 	}
-	dests, err := l.ipvsHandle.GetDestinations(srv)
+	dests, err := ipvsns.Destinations(l.ipvsHandle, srv)
 	if err != nil {
 		return
 	}
@@ -88,9 +89,9 @@ func (l *loadBalancerServer) serviceMetrics(m *metricWriter, lb *LoadBalancerInf
 		m.sample("lbmanager_destination_weight", "gauge", "IPVS weight of the destination; 0 when it failed its health check.", d.Weight, labels...)
 		m.sample("lbmanager_destination_active_connections", "gauge", "Active connections to the destination.", d.ActiveConnections, labels...)
 		m.sample("lbmanager_destination_inactive_connections", "gauge", "Inactive connections to the destination.", d.InactiveConnections, labels...)
-		m.sample("lbmanager_destination_connections_total", "counter", "Connections sent to the destination.", d.Stats.Connections, labels...)
-		m.sample("lbmanager_destination_bytes_in_total", "counter", "Bytes sent to the destination.", d.Stats.BytesIn, labels...)
-		m.sample("lbmanager_destination_bytes_out_total", "counter", "Bytes received from the destination.", d.Stats.BytesOut, labels...)
+		m.sample("lbmanager_destination_connections_total", "counter", "Connections sent to the destination.", d.Stats64.Connections, labels...)
+		m.sample("lbmanager_destination_bytes_in_total", "counter", "Bytes sent to the destination.", d.Stats64.IncomingBytes, labels...)
+		m.sample("lbmanager_destination_bytes_out_total", "counter", "Bytes received from the destination.", d.Stats64.OutgoingBytes, labels...)
 	}
 }
 

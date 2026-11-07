@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"sync"
 	"syscall"
 
@@ -16,8 +17,9 @@ import (
 	"github.com/vishvananda/netns"
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/cloudflare/ipvs"
 	"github.com/liorokman/proxmox-cloud-provider/internal/ipam"
-	"github.com/liorokman/proxmox-cloud-provider/internal/ipvs"
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvsns"
 )
 
 // Error codes that can appear in the Error.Code field
@@ -50,7 +52,7 @@ type loadBalancerServer struct {
 	externalLink netlink.Link
 	ns           netns.NsHandle
 	nlHandle     *netlink.Handle
-	ipvsHandle   *ipvs.Handle
+	ipvsHandle   ipvsns.Client
 	ipam         ipam.IPAM
 
 	// Health checking; the tracker is protected by mu
@@ -100,7 +102,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		ns.Close()
 		return nil, err
 	}
-	ipvsHandle, err := ipvs.NewInNamespace(ns)
+	ipvsHandle, err := ipvsns.Open(ns)
 	if err != nil {
 		netlinkHandle.Delete()
 		ns.Close()
@@ -220,22 +222,24 @@ func (l *loadBalancerServer) forEachLB(f func(*LoadBalancerInformation)) error {
 	return nil
 }
 
-func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol) *ipvs.Service {
-	srcIP := net.ParseIP(l.IpAddr)
-	var fam uint16 = syscall.AF_INET
-	if srcIP.To4() == nil {
-		fam = syscall.AF_INET6
+func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol) ipvs.Service {
+	addr, _ := netip.ParseAddr(l.IpAddr)
+	addr = addr.Unmap()
+	fam := ipvs.INET
+	if addr.Is6() {
+		fam = ipvs.INET6
 	}
-	var p uint16 = syscall.IPPROTO_TCP
+	p := ipvs.TCP
 	if protocol == Protocol_UDP {
-		p = syscall.IPPROTO_UDP
+		p = ipvs.UDP
 	}
-	return &ipvs.Service{
-		Address:       srcIP,
-		Port:          uint16(srcPort),
-		Protocol:      p,
-		AddressFamily: fam,
-		SchedName:     "rr",
+	return ipvs.Service{
+		Address:   addr,
+		Netmask:   ipvsns.FullMask(addr),
+		Port:      uint16(srcPort),
+		Protocol:  p,
+		Family:    fam,
+		Scheduler: "rr",
 	}
 }
 
@@ -285,7 +289,11 @@ func (l *loadBalancerServer) GetLoadBalancer(ctx context.Context, name *LoadBala
 	defer l.mu.Unlock()
 
 	curr, err := l.getLB(name.Name)
-	if err != nil && err != errNoSuchLoadbalancer {
+	if err == errNoSuchLoadbalancer {
+		// An unknown load balancer comes back empty: the caller checks the name
+		return &LoadBalancerInformation{}, nil
+	}
+	if err != nil {
 		return &LoadBalancerInformation{}, err
 	}
 	return curr, nil
@@ -407,7 +415,7 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 		}
 		for p, _ := range protocols {
 			srv := toIPVSService(lbInfo, port, p)
-			if err := l.ipvsHandle.DelService(srv); err != nil {
+			if err := l.ipvsHandle.RemoveService(srv); err != nil {
 				log.Printf("Error removing the ipvs service: %+v", err)
 				retErr.Message = err.Error()
 				retErr.Code = ErrNoSuchService
@@ -507,25 +515,18 @@ func (l *loadBalancerServer) portOwner(lb *LoadBalancerInformation, port int32, 
 // mapTarget maps a given target to the provided loadbalancer on the provided
 // srcPort
 func (l *loadBalancerServer) mapTarget(lbInfo *LoadBalancerInformation, srcPort int32, target *Target) (*Error, error) {
-	targetIP := net.ParseIP(target.DstIP)
-	var fam uint16 = syscall.AF_INET
-	if targetIP.To4() == nil {
-		fam = syscall.AF_INET6
+	newDestination, err := toIPVSDestination(target)
+	if err != nil {
+		return nil, err
 	}
+	newDestination.Weight = uint32(l.weightFor(target))
 	srv := toIPVSService(lbInfo, srcPort, target.Protocol)
-	if !l.ipvsHandle.IsServicePresent(srv) {
-		if err := l.ipvsHandle.NewService(srv); err != nil {
+	if !ipvsns.ServicePresent(l.ipvsHandle, srv) {
+		if err := l.ipvsHandle.CreateService(srv); err != nil {
 			return nil, err
 		}
 	}
-	newDestination := &ipvs.Destination{
-		Address:         targetIP,
-		Port:            uint16(target.DstPort),
-		ConnectionFlags: ipvs.ConnFwdMasq,
-		AddressFamily:   fam,
-		Weight:          l.weightFor(target),
-	}
-	err := l.ipvsHandle.NewDestination(srv, newDestination)
+	err = l.ipvsHandle.CreateDestination(srv, newDestination)
 	if errors.Is(err, syscall.EEXIST) {
 		// Already programmed, as after a restart of lbmanager: make sure it matches
 		err = l.ipvsHandle.UpdateDestination(srv, newDestination)
@@ -577,20 +578,12 @@ func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetReques
 
 	target := targetList.Target[targetToRemove]
 
-	targetIP := net.ParseIP(dtr.Target.DstIP)
-	var fam uint16 = syscall.AF_INET
-	if targetIP.To4() == nil {
-		fam = syscall.AF_INET6
-	}
 	srv := toIPVSService(lbInfo, dtr.SrcPort, target.Protocol)
-	dest := &ipvs.Destination{
-		Address:         targetIP,
-		Port:            uint16(target.DstPort),
-		ConnectionFlags: ipvs.ConnFwdMasq,
-		AddressFamily:   fam,
-		Weight:          1,
+	dest, err := toIPVSDestination(target)
+	if err != nil {
+		return &Error{Message: err.Error(), Code: ErrDelDestinationFailed}, nil
 	}
-	if err := l.ipvsHandle.DelDestination(srv, dest); err != nil {
+	if err := l.ipvsHandle.RemoveDestination(srv, dest); err != nil {
 		log.Printf("error removing a destination %+v from service %+v: %+v", dtr.Target, lbInfo, err)
 		return &Error{
 			Message: err.Error(),
@@ -601,7 +594,7 @@ func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetReques
 
 	if len(targetList.Target) == 0 {
 		// Delete the service
-		if err := l.ipvsHandle.DelService(srv); err != nil {
+		if err := l.ipvsHandle.RemoveService(srv); err != nil {
 			log.Printf("error removing a destination %+v from service %+v: %+v", dtr.Target, lbInfo, err)
 			return &Error{
 				Message: err.Error(),

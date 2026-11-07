@@ -3,6 +3,7 @@ package loadbalancer
 import (
 	"context"
 	"fmt"
+	"github.com/liorokman/proxmox-cloud-provider/internal/ipvsns"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -82,13 +83,13 @@ func TestHealthChecksSetWeights(t *testing.T) {
 
 	weights := func() map[string]int {
 		lb, _ := l.getLB("h")
-		dests, err := l.ipvsHandle.GetDestinations(toIPVSService(lb, 80, Protocol_TCP))
+		dests, err := ipvsns.Destinations(l.ipvsHandle, toIPVSService(lb, 80, Protocol_TCP))
 		if err != nil {
 			t.Fatal(err)
 		}
 		w := map[string]int{}
 		for _, d := range dests {
-			w[d.Address.String()] = d.Weight
+			w[d.Address.String()] = int(d.Weight)
 		}
 		return w
 	}
@@ -132,13 +133,13 @@ func destWeights(t *testing.T, l *loadBalancerServer, name string, port int32) m
 	if err != nil {
 		t.Fatal(err)
 	}
-	dests, err := l.ipvsHandle.GetDestinations(toIPVSService(lb, port, Protocol_TCP))
+	dests, err := ipvsns.Destinations(l.ipvsHandle, toIPVSService(lb, port, Protocol_TCP))
 	if err != nil {
 		t.Fatal(err)
 	}
 	w := map[string]int{}
 	for _, d := range dests {
-		w[fmt.Sprintf("%s:%d", d.Address, d.Port)] = d.Weight
+		w[fmt.Sprintf("%s:%d", d.Address, d.Port)] = int(d.Weight)
 	}
 	return w
 }
