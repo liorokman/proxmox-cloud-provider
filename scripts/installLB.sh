@@ -23,16 +23,12 @@ PHASE=$1; shift
 LBMANAGER_VERSION=${LBMANAGER_VERSION:-v0.2.0}
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
-urldecode () { 
-    : "${*//+/ }";
-    echo -e "${_//%/\\x}"
-}
-
 writeFile() {
 	local filename=$1; shift
 
-	local ct_notes=$(pct config $VMID | grep ^description | cut -f2- -d: )
-	ct_notes=$(urldecode $ct_notes)
+	# The container's description holds the settings as JSON; the API returns it decoded
+	local ct_notes
+	ct_notes=$(pvesh get /nodes/$(hostname)/lxc/$VMID/config --output-format json | jq -r .description)
 	ext_ip=$(echo $ct_notes | jq -r .ip)
 	ext_mask=$(echo $ct_notes | jq -r .mask)
 	ext_end=$(echo $ct_notes | jq -r .end)
