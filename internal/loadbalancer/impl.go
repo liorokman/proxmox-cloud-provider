@@ -92,10 +92,11 @@ type Intf interface {
 }
 
 func (l *loadBalancerServer) Close() {
-	l.ipvsHandle.Close()
-	l.nlHandle.Delete()
-	l.ns.Close()
-	l.db.Close()
+	// Best effort: the process is shutting down
+	_ = l.ipvsHandle.Close()
+	l.nlHandle.Close()
+	_ = l.ns.Close()
+	_ = l.db.Close()
 }
 
 func NewServer(config *koanf.Koanf) (Intf, error) {
@@ -110,19 +111,19 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 	}
 	netlinkHandle, err := netlink.NewHandleAt(ns)
 	if err != nil {
-		ns.Close()
+		_ = ns.Close()
 		return nil, err
 	}
 	netIf, err := netlinkHandle.LinkByName(config.MustString("loadbalancer.externalInterface"))
 	if err != nil {
-		netlinkHandle.Delete()
-		ns.Close()
+		netlinkHandle.Close()
+		_ = ns.Close()
 		return nil, err
 	}
 	ipvsHandle, err := ipvsns.Open(ns)
 	if err != nil {
-		netlinkHandle.Delete()
-		ns.Close()
+		netlinkHandle.Close()
+		_ = ns.Close()
 		return nil, err
 	}
 	options := rosedb.DefaultOptions
@@ -130,9 +131,9 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 	// open a database
 	db, err := rosedb.Open(options)
 	if err != nil {
-		ipvsHandle.Close()
-		netlinkHandle.Delete()
-		ns.Close()
+		_ = ipvsHandle.Close()
+		netlinkHandle.Close()
+		_ = ns.Close()
 		return nil, err
 	}
 	// Addresses that are configured on the interface, but not held by a load
@@ -151,10 +152,10 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 	}
 	ipManagement, err := ipam.New(config, isBusy)
 	if err != nil {
-		db.Close()
-		ipvsHandle.Close()
-		netlinkHandle.Delete()
-		ns.Close()
+		_ = db.Close()
+		_ = ipvsHandle.Close()
+		netlinkHandle.Close()
+		_ = ns.Close()
 		return nil, err
 	}
 	lbServer := &loadBalancerServer{
@@ -361,12 +362,12 @@ func (l *loadBalancerServer) createLocked(name string, requestedIP *string) (*Lo
 	// There could already be such an interface, since there might be another LB with the same IP and different port
 	if err := l.ensureAddrAlias(lbInfo.IpAddr); err != nil {
 		log.Printf("error adding an alias for the loadbalancer %s: %s", lbInfo.Name, err.Error())
-		l.releaseAddr(ip)
+		l.releaseAddrQuietly(ip)
 		return nil, err
 	}
 
 	if err := l.saveLB(lbInfo); err != nil {
-		l.releaseAddr(ip)
+		l.releaseAddrQuietly(ip)
 		return nil, err
 	}
 	return lbInfo, nil
@@ -451,7 +452,7 @@ func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerNam
 		for _, v := range target.Target {
 			protocols[v.Protocol] = 0
 		}
-		for p, _ := range protocols {
+		for p := range protocols {
 			srv := toIPVSService(lbInfo, port, p)
 			if err := l.ipvsHandle.RemoveService(srv); err != nil {
 				log.Printf("Error removing the ipvs service: %+v", err)
@@ -495,7 +496,11 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 	if len(targetList.Target) == 0 {
 		// The first target on this port creates the IPVS service. Another load
 		// balancer that shares the address must not already own it.
-		if other := l.portOwner(lbInfo, atr.SrcPort, atr.Target.Protocol); other != "" {
+		other, err := l.portOwner(lbInfo, atr.SrcPort, atr.Target.Protocol)
+		if err != nil {
+			return nil, err
+		}
+		if other != "" {
 			return &Error{
 				Message: fmt.Sprintf("%s port %d/%s is already used by load balancer %s", lbInfo.IpAddr, atr.SrcPort, atr.Target.Protocol, other),
 				Code:    ErrPortConflict,
@@ -534,9 +539,9 @@ func (l *loadBalancerServer) AddTarget(ctx context.Context, atr *AddTargetReques
 
 // portOwner returns the name of another load balancer that has the same
 // address and serves the given port and protocol, or "" if there is none.
-func (l *loadBalancerServer) portOwner(lb *LoadBalancerInformation, port int32, protocol Protocol) string {
+func (l *loadBalancerServer) portOwner(lb *LoadBalancerInformation, port int32, protocol Protocol) (string, error) {
 	owner := ""
-	l.forEachLB(func(other *LoadBalancerInformation) {
+	err := l.forEachLB(func(other *LoadBalancerInformation) {
 		if owner != "" || other.Name == lb.Name || other.IpAddr != lb.IpAddr {
 			return
 		}
@@ -547,7 +552,14 @@ func (l *loadBalancerServer) portOwner(lb *LoadBalancerInformation, port int32, 
 			}
 		}
 	})
-	return owner
+	return owner, err
+}
+
+// releaseAddrQuietly gives an address back while another error is being reported.
+func (l *loadBalancerServer) releaseAddrQuietly(ip net.IP) {
+	if err := l.releaseAddr(ip); err != nil {
+		log.Printf("releasing %s: %v", ip, err)
+	}
 }
 
 // mapTarget maps a given target to the provided loadbalancer on the provided
@@ -598,7 +610,7 @@ func (l *loadBalancerServer) DelTarget(ctx context.Context, dtr *DelTargetReques
 		}, nil
 	}
 	targetToRemove := -1
-	for target, _ := range targetList.Target {
+	for target := range targetList.Target {
 		if targetList.Target[target].Protocol == dtr.Target.Protocol &&
 			targetList.Target[target].DstIP == dtr.Target.DstIP &&
 			targetList.Target[target].DstPort == dtr.Target.DstPort {

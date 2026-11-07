@@ -57,7 +57,7 @@ func Open(ns netns.NsHandle) (Client, error) {
 			done <- result{nil, fmt.Errorf("reading the current network namespace: %w", err)}
 			return
 		}
-		defer orig.Close()
+		defer func() { _ = orig.Close() }()
 		if err := netns.Set(ns); err != nil {
 			runtime.UnlockOSThread()
 			done <- result{nil, fmt.Errorf("entering the network namespace: %w", err)}
@@ -76,7 +76,7 @@ func Open(ns netns.NsHandle) (Client, error) {
 	r := <-done
 	if r.err != nil {
 		if cl, ok := r.c.(io.Closer); ok && r.c != nil {
-			cl.Close()
+			_ = cl.Close()
 		}
 		return nil, r.err
 	}

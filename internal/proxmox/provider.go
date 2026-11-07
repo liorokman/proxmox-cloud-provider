@@ -130,7 +130,7 @@ func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilde
 		grpc.WithTransportCredentials(creds),
 	}
 	serverAddr := fmt.Sprintf("%s:%d", p.config.ManagerHost, p.config.ManagerPort)
-	conn, err := grpc.Dial(serverAddr, opts...)
+	conn, err := grpc.NewClient(serverAddr, opts...)
 	if err != nil {
 		log.Fatalf("failed to connect to the lbmanager: %s", err.Error())
 	}
@@ -139,7 +139,7 @@ func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilde
 	}
 	go func() {
 		<-stop
-		conn.Close()
+		_ = conn.Close()
 	}()
 }
 

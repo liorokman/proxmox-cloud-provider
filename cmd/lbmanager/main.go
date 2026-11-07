@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -60,7 +61,7 @@ func loadConfig() error {
 	}
 
 	if !somethingLoaded {
-		return fmt.Errorf("No configuration found. Cowardly refusing to continue.")
+		return errors.New("no configuration found, cowardly refusing to continue")
 	}
 	log.Printf("done\n")
 	return nil
@@ -71,7 +72,7 @@ func loadConfigFile(configFile string) error {
 	if err := k.Load(mainConfigFile, yaml.Parser()); err != nil {
 		return err
 	}
-	mainConfigFile.Watch(func(event any, err error) {
+	if err := mainConfigFile.Watch(func(event any, err error) {
 		if err != nil {
 			log.Printf("watch error: %v\n", err)
 			return
@@ -82,8 +83,12 @@ func loadConfigFile(configFile string) error {
 			log.Printf("error loading the new config: %v\n", err)
 			return
 		}
-		k.Merge(tmpK)
-	})
+		if err := k.Merge(tmpK); err != nil {
+			log.Printf("error merging the new config: %v\n", err)
+		}
+	}); err != nil {
+		log.Printf("not watching %s for changes: %v", configFile, err)
+	}
 	return nil
 }
 
@@ -132,7 +137,7 @@ func run(ctx context.Context, config *koanf.Koanf) error {
 	if err != nil {
 		return fmt.Errorf("failed listening: %v", err)
 	}
-	defer lis.Close()
+	defer func() { _ = lis.Close() }()
 	lbServer, err := loadbalancer.NewServer(config)
 	if err != nil {
 		return fmt.Errorf("failed starting the loadbalancer manager: %v", err)

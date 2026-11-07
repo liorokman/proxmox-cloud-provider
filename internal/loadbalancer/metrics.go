@@ -45,7 +45,7 @@ type metricWriter struct {
 func (m *metricWriter) sample(name, kind, help string, value any, labels ...string) {
 	if !m.typed[name] {
 		m.typed[name] = true
-		fmt.Fprintf(m.w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
+		_, _ = fmt.Fprintf(m.w, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, kind)
 	}
 	parts := make([]string, 0, len(labels)/2)
 	for i := 0; i+1 < len(labels); i += 2 {
@@ -54,7 +54,7 @@ func (m *metricWriter) sample(name, kind, help string, value any, labels ...stri
 	if len(parts) > 0 {
 		name += "{" + strings.Join(parts, ",") + "}"
 	}
-	fmt.Fprintf(m.w, "%s %v\n", name, value)
+	_, _ = fmt.Fprintf(m.w, "%s %v\n", name, value)
 }
 
 // WriteMetrics renders all the metrics.
@@ -64,7 +64,9 @@ func (l *loadBalancerServer) WriteMetrics(w io.Writer) {
 	defer l.mu.Unlock()
 
 	all := []*LoadBalancerInformation{}
-	l.forEachLB(func(lb *LoadBalancerInformation) { all = append(all, lb) })
+	if err := l.forEachLB(func(lb *LoadBalancerInformation) { all = append(all, lb) }); err != nil {
+		log.Printf("metrics: cannot read the load balancers: %v", err)
+	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
 	m.sample("lbmanager_loadbalancers", "gauge", "Number of defined load balancers.", len(all))
 	for _, lb := range all {
@@ -128,7 +130,7 @@ func (l *loadBalancerServer) ServeMetrics(ctx context.Context, addr string) erro
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
-		srv.Close()
+		_ = srv.Close()
 	}()
 	go func() {
 		if err := srv.Serve(lis); err != nil && err != http.ErrServerClosed {

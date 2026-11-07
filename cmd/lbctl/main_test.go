@@ -302,7 +302,7 @@ func TestRunReportsFailures(t *testing.T) {
 	}
 	o := base
 	o.op = "bogus"
-	if err := run(context.Background(), &o, koanf.New(".")); err == nil || !strings.Contains(err.Error(), "Unknown operation") {
+	if err := run(context.Background(), &o, koanf.New(".")); err == nil || !strings.Contains(err.Error(), "unknown operation") {
 		t.Errorf("unknown operation: %v", err)
 	}
 	// No credentials at all

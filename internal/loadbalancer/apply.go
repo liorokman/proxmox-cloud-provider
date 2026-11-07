@@ -82,7 +82,11 @@ func (l *loadBalancerServer) applyPort(lb *LoadBalancerInformation, port int32, 
 	current := lb.Targets[port].GetTarget()
 	if len(current) == 0 && len(wanted) > 0 {
 		for _, t := range wanted {
-			if other := l.portOwner(lb, port, t.Protocol); other != "" {
+			other, err := l.portOwner(lb, port, t.Protocol)
+			if err != nil {
+				return fmt.Sprintf("cannot check whether %s port %d/%s is in use: %v", lb.IpAddr, port, t.Protocol, err)
+			}
+			if other != "" {
 				return fmt.Sprintf("%s port %d/%s is already used by load balancer %s", lb.IpAddr, port, t.Protocol, other)
 			}
 		}

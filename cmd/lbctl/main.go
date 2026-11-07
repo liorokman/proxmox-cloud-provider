@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -66,7 +67,7 @@ func parseFlags(args []string, output io.Writer) (*options, error) {
 		return nil, err
 	}
 	if o.name == "" && o.op != "list" {
-		return nil, fmt.Errorf("no loadbalancer name provided.")
+		return nil, errors.New("no loadbalancer name provided")
 	}
 	return o, nil
 }
@@ -127,13 +128,13 @@ func run(ctx context.Context, o *options, k *koanf.Koanf) error {
 	if err != nil {
 		return fmt.Errorf("error connecting to lbmanager: %+v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	return execute(ctx, loadbalancer.NewLoadBalancerClient(conn), o)
 }
 
 // execute performs the operation on the server.
 func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *options) error {
-	var p loadbalancer.Protocol = loadbalancer.Protocol_TCP
+	p := loadbalancer.Protocol_TCP
 	if !o.tcp {
 		p = loadbalancer.Protocol_UDP
 	}
@@ -149,14 +150,14 @@ func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *opt
 	case "addSrv":
 		lbInfo, err := client.Create(ctx, &loadbalancer.CreateLoadBalancer{Name: o.name, IpAddr: &o.service})
 		if err != nil {
-			return fmt.Errorf("Error during create: %s", err.Error())
+			return fmt.Errorf("error during create: %s", err.Error())
 		}
 		log.Printf("LBInfo: %+v\n", lbInfo)
 
 	case "delSrv":
 		ret, err := client.Delete(ctx, &loadbalancer.LoadBalancerName{Name: o.name})
 		if err != nil {
-			return fmt.Errorf("Error during delete: %s", err.Error())
+			return fmt.Errorf("error during delete: %s", err.Error())
 		}
 		reportResult(ret)
 
@@ -167,7 +168,7 @@ func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *opt
 			Target:  &loadbalancer.Target{DstIP: o.service, DstPort: int32(o.dstPort), Protocol: p},
 		})
 		if err != nil {
-			return fmt.Errorf("Error adding destination: %s", err.Error())
+			return fmt.Errorf("error adding destination: %s", err.Error())
 		}
 		reportResult(ret)
 
@@ -178,14 +179,14 @@ func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *opt
 			Target:  &loadbalancer.Target{DstIP: o.service, DstPort: int32(o.dstPort), Protocol: p},
 		})
 		if err != nil {
-			return fmt.Errorf("Error deleting destination: %s", err.Error())
+			return fmt.Errorf("error deleting destination: %s", err.Error())
 		}
 		reportResult(ret)
 
 	case "list":
 		stream, err := client.GetLoadBalancers(ctx, &emptypb.Empty{})
 		if err != nil {
-			return fmt.Errorf("Failed to list load balancers: %s", err.Error())
+			return fmt.Errorf("failed to list load balancers: %s", err.Error())
 		}
 		for {
 			lb, err := stream.Recv()
@@ -193,12 +194,12 @@ func execute(ctx context.Context, client loadbalancer.LoadBalancerClient, o *opt
 				break
 			}
 			if err != nil {
-				return fmt.Errorf("Error listing load balancers %v", err)
+				return fmt.Errorf("error listing load balancers: %v", err)
 			}
 			log.Println(lb)
 		}
 	default:
-		return fmt.Errorf("Unknown operation %s", o.op)
+		return fmt.Errorf("unknown operation %s", o.op)
 	}
 	return nil
 }

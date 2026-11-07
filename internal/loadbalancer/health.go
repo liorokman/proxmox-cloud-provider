@@ -191,11 +191,13 @@ func (p *tcpProber) check(t *Target) bool {
 	if err != nil {
 		return false
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if t.HealthCheckPort == 0 {
 		return true
 	}
-	c.SetDeadline(time.Now().Add(p.timeout))
+	if err := c.SetDeadline(time.Now().Add(p.timeout)); err != nil {
+		return false
+	}
 	if _, err := fmt.Fprintf(c, "GET /healthz HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", t.DstIP); err != nil {
 		return false
 	}
@@ -239,7 +241,7 @@ func (l *loadBalancerServer) checkHealthOnce() (anyDown bool) {
 	// Snapshot the targets, so the probes run without holding the lock
 	l.mu.Lock()
 	toProbe := map[string]*Target{}
-	l.forEachLB(func(lb *LoadBalancerInformation) {
+	err := l.forEachLB(func(lb *LoadBalancerInformation) {
 		for _, tl := range lb.Targets {
 			for _, t := range tl.GetTarget() {
 				if t.Protocol != Protocol_TCP {
@@ -250,6 +252,11 @@ func (l *loadBalancerServer) checkHealthOnce() (anyDown bool) {
 		}
 	})
 	l.mu.Unlock()
+	if err != nil {
+		// Without the list, the targets would all look removed and be forgotten
+		log.Printf("health: cannot read the load balancers: %v", err)
+		return true
+	}
 
 	var wg sync.WaitGroup
 	results := make(map[string]bool, len(toProbe))
@@ -282,7 +289,7 @@ func (l *loadBalancerServer) checkHealthOnce() (anyDown bool) {
 	l.health.forget(keep)
 	// Apply the weights. Re-applying an unchanged weight is harmless, so a failed
 	// update is simply retried on the next round.
-	l.forEachLB(func(lb *LoadBalancerInformation) {
+	if err := l.forEachLB(func(lb *LoadBalancerInformation) {
 		for port, tl := range lb.Targets {
 			for _, t := range tl.GetTarget() {
 				if t.Protocol != Protocol_TCP || !keep[healthKey(t)] {
@@ -293,7 +300,9 @@ func (l *loadBalancerServer) checkHealthOnce() (anyDown bool) {
 				}
 			}
 		}
-	})
+	}); err != nil {
+		log.Printf("health: cannot read the load balancers: %v", err)
+	}
 	for k := range changed {
 		if l.health.isHealthy(k) {
 			log.Printf("health: target %s is up", k)

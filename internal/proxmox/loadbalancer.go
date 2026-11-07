@@ -198,7 +198,7 @@ func (p *LoadBalancer) EnsureLoadBalancerDeleted(ctx context.Context, clusterNam
 	if err != nil {
 		return err
 	} else if code.Code != loadbalancer.ErrSuccess && code.Code != loadbalancer.ErrNoSuchLB {
-		return fmt.Errorf("Failed to delete loadbalancer %s: (%d) %s", name, code.Code, code.Message)
+		return fmt.Errorf("failed to delete loadbalancer %s: (%d) %s", name, code.Code, code.Message)
 	}
 	return nil
 }

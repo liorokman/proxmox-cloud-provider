@@ -73,7 +73,7 @@ func Send(ns netns.NsHandle, ifname string, ip netip.Addr) error {
 			done <- result{err: err}
 			return
 		}
-		defer orig.Close()
+		defer func() { _ = orig.Close() }()
 		if err := netns.Set(ns); err != nil {
 			runtime.UnlockOSThread()
 			done <- result{err: fmt.Errorf("entering the network namespace: %w", err)}
@@ -83,7 +83,7 @@ func Send(ns netns.NsHandle, ifname string, ip netip.Addr) error {
 		if err := netns.Set(orig); err != nil {
 			// Leave the thread locked, so that Go discards it with this goroutine
 			if r.fd > 0 {
-				unix.Close(r.fd)
+				_ = unix.Close(r.fd)
 			}
 			done <- result{err: fmt.Errorf("leaving the network namespace: %w", err)}
 			return
@@ -96,11 +96,11 @@ func Send(ns netns.NsHandle, ifname string, ip netip.Addr) error {
 		return r.err
 	}
 	if err := write(r.fd, r.ifi, r.buf); err != nil {
-		unix.Close(r.fd)
+		_ = unix.Close(r.fd)
 		return err
 	}
 	go func() {
-		defer unix.Close(r.fd)
+		defer func() { _ = unix.Close(r.fd) }()
 		for _, d := range []time.Duration{200 * time.Millisecond, time.Second} {
 			time.Sleep(d)
 			if write(r.fd, r.ifi, r.buf) != nil {
