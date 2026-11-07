@@ -535,7 +535,9 @@ cloud provider sets what the plugin needs on the nodes: the `topology.kubernetes
 Proxmox cluster name), the `topology.kubernetes.io/zone` label (the Proxmox node), and a provider ID of the form
 `proxmox://<cluster name>/<VM ID>`. Tested with plugin v0.22.0 (chart 0.5.15) on Proxmox VE 9.2 and
 Kubernetes 1.37: dynamic provisioning on an LVM storage, a pod that moves to another worker and
-finds its data, online expansion, and deleting the claim removes the disk.
+finds its data, online expansion, and deleting the claim removes the disk. The same on Ceph (an RBD
+pool as the storage): a pod that moves to a worker on another Proxmox node finds its data, because
+the plugin detaches the disk from one VM and attaches it to the other.
 
 The plugin attaches the volumes to the VMs as extra SCSI disks, so the VMs need the
 `virtio-scsi-single` (or `virtio-scsi-pci`) SCSI controller, which the VMs made by the bootstrap script have. Local storage
@@ -611,6 +613,9 @@ The plugin attaches the volumes to the VMs as extra SCSI disks, so the VMs need 
      resources: {requests: {storage: 2Gi}}
    EOF
    ```
+
+   For Ceph, use `storage: <the pool's storage>` in the storage class. The plugin has one Proxmox
+   endpoint (`url`): while that node is down the volumes can't be created, attached or detached.
 
    The storage class uses `WaitForFirstConsumer`: the disk is created when a pod that uses the claim is scheduled, on
    the Proxmox node of the worker that gets it.
