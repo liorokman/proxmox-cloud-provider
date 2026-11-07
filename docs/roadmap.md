@@ -96,7 +96,8 @@ role has a new name, so `helm upgrade` replaces the old `cluster-admin` binding.
 The cloud provider and `lbmanager` must be upgraded together (the new
 `Apply` call), and the Proxmox role needs `VM.GuestAgent.Audit`. The hookscript
 uses a third NIC when the container has one, disables IPv6 on the LAN interface
-(problem 13), and sends a gratuitous ARP when addresses appear. Node labels are
+(problem 13), and announces the interface address when it comes up (v0.3.0: `lbmanager` also
+sends a gratuitous ARP for every virtual IP it adds). Node labels are
 only set when a node registers, so existing nodes keep their old ones.
 
 4. Node addresses from the QEMU guest agent, falling back to static cloud-init

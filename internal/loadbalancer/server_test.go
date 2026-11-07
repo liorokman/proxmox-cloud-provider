@@ -17,18 +17,21 @@
 package loadbalancer
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/knadh/koanf/v2"
+	"github.com/liorokman/proxmox-cloud-provider/internal/garp"
 	"github.com/liorokman/proxmox-cloud-provider/internal/nstest"
 	"github.com/vishvananda/netns"
 	"google.golang.org/grpc"
@@ -422,4 +425,36 @@ func TestNewTargetComesUpQuicklyAfterItsPortOpens(t *testing.T) {
 	acceptForever(l2)
 	waitFor("the target to come up", 5*time.Second, func() bool { return destWeights(t, srv, "quick", 80)[key] == 1 })
 	t.Logf("the target came up %v after its port opened", time.Since(start).Round(10*time.Millisecond))
+}
+
+// A new address is announced on the LAN with a gratuitous ARP, once; sharing an
+// address that is already there does not repeat it.
+func TestNewAddressIsAnnounced(t *testing.T) {
+	k := testConfig(t)
+	ns := k.String("loadbalancer.namespace")
+	capture := nstest.CaptureARP(t, ns)
+	s := newTestServerWith(k, t)
+	ctx := context.Background()
+
+	if _, err := s.Create(ctx, &CreateLoadBalancer{Name: "a", IpAddr: asPtr("192.168.87.214")}); err != nil {
+		t.Fatal(err)
+	}
+	want, err := garp.Frame(nstest.MAC(t, ns, "dummy0"), netip.MustParseAddr("192.168.87.214"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		got := capture.Next(3 * time.Second)
+		if got == nil || !bytes.Equal(got[:len(want)], want) {
+			t.Fatalf("announcement %d: got % x", i, got)
+		}
+	}
+
+	// A second load balancer on the same address adds nothing to the interface
+	if _, err := s.Create(ctx, &CreateLoadBalancer{Name: "b", IpAddr: asPtr("192.168.87.214")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := capture.Next(1500 * time.Millisecond); got != nil {
+		t.Errorf("a shared address was announced again: % x", got)
+	}
 }

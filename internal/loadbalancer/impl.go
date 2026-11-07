@@ -34,6 +34,7 @@ import (
 	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/cloudflare/ipvs"
+	"github.com/liorokman/proxmox-cloud-provider/internal/garp"
 	"github.com/liorokman/proxmox-cloud-provider/internal/ipam"
 	"github.com/liorokman/proxmox-cloud-provider/internal/ipvsns"
 )
@@ -411,7 +412,24 @@ func (l *loadBalancerServer) ensureAddrAlias(addrString string) error {
 			return nil
 		}
 	}
-	return l.nlHandle.AddrAdd(l.externalLink, requiredAddr)
+	if err := l.nlHandle.AddrAdd(l.externalLink, requiredAddr); err != nil {
+		return err
+	}
+	l.announce(externalIP)
+	return nil
+}
+
+// announce tells the LAN where a new address lives. Hosts that still hold the
+// MAC address of an earlier owner of the address (a replaced container, for
+// example) would otherwise send to the old one for several seconds.
+func (l *loadBalancerServer) announce(ip net.IP) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok || !addr.Unmap().Is4() {
+		return
+	}
+	if err := garp.Send(l.ns, l.externalLink.Attrs().Name, addr); err != nil {
+		log.Printf("cannot announce %s on the LAN: %v", ip, err)
+	}
 }
 
 func (l *loadBalancerServer) Delete(ctx context.Context, lbName *LoadBalancerName) (*Error, error) {

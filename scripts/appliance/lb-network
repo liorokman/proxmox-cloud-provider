@@ -47,8 +47,9 @@ ip netns exec LB ip addr add "$ETH1_ADDR" dev eth1
 ip netns exec LB ip link set eth1 up
 
 # eth2 is the LAN side. IPv6 is not supported, and the LAN's router
-# advertisements must not give it an address. A gratuitous ARP announces
-# each new address, so the LAN notices a changed MAC address.
+# advertisements must not give it an address. arp_notify announces the
+# interface's own address when it comes up; lbmanager announces every virtual
+# IP it adds, so the LAN notices a changed MAC address.
 ip link set eth2 netns LB
 ip netns exec LB sysctl -q net.ipv6.conf.eth2.disable_ipv6=1
 ip netns exec LB sysctl -q net.ipv4.conf.eth2.arp_notify=1

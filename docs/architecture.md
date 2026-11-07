@@ -69,6 +69,11 @@ addresses that can only be requested with `loadBalancerIP`. Addresses outside
 both ranges, or in use by something else on the interface, are refused. Several
 Services can share a VIP on different ports.
 
+When `lbmanager` adds a virtual IP to the interface it sends a gratuitous ARP
+(three times, within a second), so that LAN hosts which still hold the MAC
+address of an earlier owner of the address, such as a replaced container, switch
+to the new one at once instead of failing for several seconds.
+
 `lbmanager` probes every TCP target with a TCP connect from inside the `LB`
 namespace. A target that fails `fall` probes in a row gets IPVS weight 0 (no
 new connections, existing ones continue), and gets weight 1 again after `rise`
@@ -108,8 +113,9 @@ every start it:
    carries the container's external address and every virtual IP. Without an
    `eth2`, the script falls back to the older layout: `eth0` is bridged to a
    veth pair whose other end, `external0`, is in the namespace;
-2. disables IPv6 on the external interface and turns on gratuitous ARP when
-   an address is added;
+2. disables IPv6 on the external interface, and turns on `arp_notify` so the
+   interface announces its own address when it comes up (`lbmanager` announces
+   every virtual IP it adds, see below);
 3. enables forwarding and IPVS connection tracking in the namespace;
 4. configures source NAT so the container is the default gateway of the
    cluster to the LAN and the internet;

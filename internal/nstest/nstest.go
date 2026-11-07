@@ -19,13 +19,16 @@ package nstest
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 var counter atomic.Int32
@@ -98,4 +101,85 @@ func AddAddr(t testing.TB, name string, cidrs ...string) {
 			t.Fatal(err)
 		}
 	}
+}
+
+// ARPCapture receives the ARP frames that a namespace sends or receives.
+type ARPCapture struct {
+	fd int
+}
+
+// CaptureARP starts capturing ARP frames in the namespace.
+func CaptureARP(t testing.TB, name string) *ARPCapture {
+	t.Helper()
+	ns, err := netns.GetFromName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	orig, err := netns.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer orig.Close()
+	if err := netns.Set(ns); err != nil {
+		t.Fatal(err)
+	}
+	defer netns.Set(orig) //nolint:errcheck
+
+	// A socket for one protocol only sees received frames; ETH_P_ALL also shows
+	// what the namespace sends. The protocol is given in network byte order.
+	proto := uint16(unix.ETH_P_ALL)
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(proto<<8|proto>>8))
+	if err != nil {
+		t.Skipf("cannot open a packet socket: %v", err)
+	}
+	t.Cleanup(func() { unix.Close(fd) })
+	return &ARPCapture{fd: fd}
+}
+
+// Next returns the next ARP frame, or nil if none arrives within the timeout.
+func (c *ARPCapture) Next(timeout time.Duration) []byte {
+	deadline := time.Now().Add(timeout)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return nil
+		}
+		tv := unix.NsecToTimeval(left.Nanoseconds())
+		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+			return nil
+		}
+		buf := make([]byte, 128)
+		n, _, err := unix.Recvfrom(c.fd, buf, 0)
+		if err != nil {
+			return nil
+		}
+		// Ethernet type 0x0806 at bytes 12 and 13
+		if n >= 14 && buf[12] == 0x08 && buf[13] == 0x06 {
+			return buf[:n]
+		}
+	}
+}
+
+// MAC returns the hardware address of an interface of the namespace.
+func MAC(t testing.TB, name, ifname string) net.HardwareAddr {
+	t.Helper()
+	ns, err := netns.GetFromName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	h, err := netlink.NewHandleAt(ns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	link, err := h.LinkByName(ifname)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return link.Attrs().HardwareAddr
 }

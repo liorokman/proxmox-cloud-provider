@@ -87,7 +87,7 @@ fi
 # 5. Setup the LAN device in the LB network namespace. IPv6 is not supported,
 # and the LAN's router advertisements must not give it an address.
 ip netns exec LB sysctl -q net.ipv6.conf.\$EXT_IF.disable_ipv6=1
-# Announce new addresses with a gratuitous ARP, so the LAN notices a changed MAC address
+# Announce the interface address when it comes up (lbmanager announces every virtual IP it adds)
 ip netns exec LB sysctl -q net.ipv4.conf.\$EXT_IF.arp_notify=1
 ip netns exec LB ip link set \$EXT_IF up
 ip netns exec LB ip addr add $ext_ip/$ext_mask dev \$EXT_IF

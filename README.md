@@ -511,6 +511,10 @@ uses the same API. Nothing needs to be done by hand.
   whole cluster. It doesn't touch existing ones.
 * **Hookscript:** `installLB.sh` reads the container settings through the
   Proxmox API (`pvesh`), so replace it together with the binaries.
+* **Fixed:** when a virtual IP moved to a container with another MAC address
+  (a replaced load balancer), LAN hosts kept using the old MAC for several
+  seconds. `lbmanager` now announces every virtual IP it adds with a gratuitous
+  ARP.
 * **Fixed:** a new `LoadBalancer` Service used to refuse connections for about
   7 seconds, because its targets were probed before kube-proxy opened the
   NodePort and then needed two probes five seconds apart to come back. Targets
@@ -539,8 +543,8 @@ uses the same API. Nothing needs to be done by hand.
   the old script built inside the container. To switch, stop the container and
   add `-net2 name=eth2,bridge=vmbr0,firewall=1,type=veth`. `$LB_EXT_IP` and the
   virtual IPs then move to `eth2` and `eth0` only keeps the management
-  address. The old layout still works if you do nothing. The script sends a
-  gratuitous ARP, but expect a short outage.
+  address. The old layout still works if you do nothing. Expect a short
+  outage.
 * **IPv6 is disabled** on the container's external interface.
 * **Address ranges:** explicit `loadBalancerIP` addresses are now accepted only
   from the dynamic range (and an optional `staticRange` in `lbmanager.yaml`).
