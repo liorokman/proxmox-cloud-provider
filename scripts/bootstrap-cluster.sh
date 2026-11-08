@@ -535,8 +535,6 @@ step_vms() {
 				# Cloned on the template's node (--target doesn't allow node local storage), then
 				# moved to the node that is to keep it. A stopped VM moves with its disk.
 				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --pool "$POOL" > /dev/null
-				local want; want=$(cp_node "$i")
-				[ "$(guest_node "$id")" = "$want" ] || qm migrate "$id" "$want" --targetstorage "$CP_STORAGE" > /dev/null
 			else
 				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
 			fi
@@ -550,6 +548,9 @@ step_vms() {
 			qm config "$id" | grep '^virtio0:' | grep -q "size=${NODE_DISK_GB}G" \
 				|| die "the disk of $name is not ${NODE_DISK_GB}G: check the storage $STORAGE and run 'qm resize $id virtio0 ${NODE_DISK_GB}G'"
 			qm cloudinit update "$id"
+			if is_cp "$i" && cp_local && [ "$(guest_node "$id")" != "$(cp_node "$i")" ]; then
+				qm migrate "$id" "$(cp_node "$i")" --targetstorage "$CP_STORAGE" > /dev/null
+			fi
 			info "created $name ($id) at $ip"
 		fi
 		# A run that was interrupted between the clone and the configuration leaves a VM that
