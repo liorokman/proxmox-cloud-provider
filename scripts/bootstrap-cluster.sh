@@ -532,9 +532,11 @@ step_vms() {
 		id=$(node_vmid "$i"); name=$(node_name "$i"); ip=$(node_ip "$i")
 		if ! vm_exists "$id"; then
 			if is_cp "$i" && cp_local; then
-				# The template is on shared storage, so any node can clone it; the clone is made on
-				# the node that is to keep it (--target doesn't allow node local storage)
-				run_on "$(cp_node "$i")" qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --pool "$POOL" > /dev/null
+				# Cloned on the template's node (--target doesn't allow node local storage), then
+				# moved to the node that is to keep it. A stopped VM moves with its disk.
+				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --pool "$POOL" > /dev/null
+				local want; want=$(cp_node "$i")
+				[ "$(guest_node "$id")" = "$want" ] || qm migrate "$id" "$want" --targetstorage "$CP_STORAGE" > /dev/null
 			else
 				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
 			fi
