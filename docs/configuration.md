@@ -11,6 +11,7 @@ The chart renders the cloud provider's `cloud-config.yaml` from these values
 | Value | Default | |
 |---|---|---|
 | `lbmanager.hostname` | | Management address of the load balancer container |
+| `lbmanager.additionalHostnames` | none | The management addresses of the other containers of a load balancer pair (`LB_REPLICAS=2`). The first one picks the address of a new Service; every Service is applied to all of them, and a Service that can't reach one of them is retried |
 | `lbmanager.port` | `9999` | gRPC port of `lbmanager` |
 | `lbmanager.tls.key`, `.cert`, `.caCert` | | mTLS credentials (PEM) of the `lbctl` client of the container |
 | `proxmox.apiURL` | | For example `https://pve:8006/api2/json` |
@@ -58,6 +59,9 @@ working directory. The appliance writes the file from `/etc/lbmanager/appliance.
 | `loadbalancer.ipam.cidr` | | The LAN, with the container's own address: `192.168.1.51/24` |
 | `loadbalancer.ipam.dynamicRange.startAt`, `.endAt` | | Addresses handed out to Services. Must be inside the CIDR |
 | `loadbalancer.ipam.staticRange.startAt`, `.endAt` | none | Optional. Addresses that are only given when a Service asks for them (`loadBalancerIP`) |
+| `loadbalancer.keepalived.vipsFile` | off | HA pair: the virtual IPs are listed in this file (`/etc/keepalived/vips.conf`), which keepalived includes, instead of being configured on the interface. keepalived then adds them on the active container only |
+| `loadbalancer.keepalived.pidFile` | `/run/lb-keepalived.pid` | keepalived gets SIGHUP from `lbmanager` when the file changes |
+| `loadbalancer.keepalived.reserved` | | The container's own addresses; Services can't claim them (they aren't on the interface of the passive container) |
 | `loadbalancer.healthCheck.enabled` | `true` | |
 | `loadbalancer.healthCheck.interval` | `5s` | Between probes of a healthy target |
 | `loadbalancer.healthCheck.downInterval` | `1s` | Between probes while a target is down |
@@ -112,7 +116,7 @@ shows the common ones. Settings that are not obvious:
 | `EXTRA_CP_VMID_START`, `EXTRA_CP_IP_START` | `CONTROL_PLANE_VMID + 50`, `NODE_IP_START + 50` | VM ID and last address octet of the second control plane, the others follow. Apart from the workers' numbers, so that adding workers doesn't renumber them |
 | `HA` | `no` | `yes`: HA resources; needs 2 or more Proxmox nodes. With 3 or more there are anti-affinity rules too (load balancer away from the control plane, workers from each other), as far as the guests still fit on the nodes left after one node fails. With 3 or more control planes, one per Proxmox node, which keeps etcd's majority through a node failure |
 | `LB_MODE` | `appliance` | Or `hookscript` |
-| `LB_REPLICAS` | `1` | `2`: a second load balancer container (active/passive pair, **experimental**: `lbmanager` does not yet keep the virtual IPs of Services on the active container, and the cloud provider only talks to the first one). Needs `LB_MODE=appliance`, and `LB_OWN_EXT_IP`, `LB2_OWN_EXT_IP` (each container's own LAN address; `LB_EXT_IP` becomes the shared egress address) and `LB2_MGMT_IP`. `LB2_VMID` defaults to `LB_VMID + 1`. The node network gets the gateway address on whichever container is active, and the containers take the last two addresses (`.253`, `.254`) |
+| `LB_REPLICAS` | `1` | `2`: a second load balancer container (an active/passive pair: keepalived floats the addresses and the IPVS connection state is synchronized; the cloud provider applies every Service to both). Needs `LB_MODE=appliance`, and `LB_OWN_EXT_IP`, `LB2_OWN_EXT_IP` (each container's own LAN address; `LB_EXT_IP` becomes the shared egress address) and `LB2_MGMT_IP`. `LB2_VMID` defaults to `LB_VMID + 1`. The node network gets the gateway address on whichever container is active, and the containers take the last two addresses (`.253`, `.254`) |
 | `IMAGE_TAG`, `IMAGE_ARCHIVE` | | A cloud provider image other than the chart's, or one loaded from a local archive |
 
 ## Appliance (`/etc/lbmanager/appliance.env`)

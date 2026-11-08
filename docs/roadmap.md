@@ -66,9 +66,10 @@ Proxmox VE 9.2.
 4. **Declarative API.** `Apply(name, vip, ports → targets)` converges IPVS and
    the database atomically, under a mutex. Keep the current RPCs for `lbctl`.
    Fixes 7 and 8, and makes the cloud provider side trivial.
-5. **A highly available pair.** Two containers running keepalived (VRRP over
-   unicast) float the VNet gateway address and the VIPs, and conntrackd keeps
-   connection state in sync. `lbmanager` runs on both, and the cloud provider
+5. **A highly available pair** (done, `LB_REPLICAS=2`). Two containers running keepalived (VRRP over
+   unicast) float the VNet gateway address, the egress address and the VIPs, and the
+   IPVS connection synchronization daemon keeps the connection state in sync.
+   `lbmanager` runs on both and lists the VIPs for keepalived, and the cloud provider
    applies to both. Fixes 2.
 6. **Packaging.** Build the container once, as a template or as a Proxmox VE
    9.1+ OCI application container, and set the network up from a systemd unit.
@@ -147,8 +148,8 @@ only set when a node registers, so existing nodes keep their old ones.
     releases with checksums and a signed image. **S–M**
 17. An optional allocator backend that uses a real NetBox, which Proxmox can
     also use as the IPAM of the VNets. **M**
-10. A highly available load balancer pair with keepalived and conntrackd.
-    Worth it with a second Proxmox node, or for upgrades without an outage; on
+10. ~~A highly available load balancer pair with keepalived~~ (done, optional:
+    `LB_REPLICAS=2`; conntrackd wasn't needed, see below). Worth it with a second Proxmox node, or for upgrades without an outage; on
     one node it protects against container failures only, not host failures. **L**
 13. Hand the gateway role to SDN where the zone supports it (Simple zone SNAT,
     EVPN exit nodes). Egress would survive a restart of the load balancer
@@ -159,6 +160,20 @@ only set when a node registers, so existing nodes keep their old ones.
     zone doesn't span Proxmox nodes, EVPN exit nodes are tech preview and
     untestable on one node, and the VXLAN zone used here has no SDN SNAT at all.
     The HA pair is the more direct way to keep egress up. **M**
+
+Implementation notes for the load balancer pair:
+
+* One VRRP instance in the `LB` namespace (unicast over `eth1`, `nopreempt`) floats the node
+  network's gateway address, the shared egress address and the default route. Each container also
+  has its own addresses on both networks. `lbmanager` writes the Services' addresses to a file that
+  keepalived includes, and sends it SIGHUP, so only the active container answers ARP for them.
+* `lvs_sync_daemon` (with `maxlen 1300`: the VNet path MTU is 1450) synchronizes the IPVS connection
+  table. Established connections survive a switch, and a crash of the active container.
+* The egress SNAT skips IPVS replies. Without that exemption the new active container, which has no
+  conntrack entry, would rewrite the replies of synchronized connections and reset every one of them.
+* Limits: connections from a node to a virtual IP (hairpin, e.g. the API server through its VIP) are
+  masqueraded with the container's own address and reset on a switch; a switch takes about 4 s;
+  new Services need both containers to be reachable (the cloud provider retries).
 
 Implementation notes for P0:
 
