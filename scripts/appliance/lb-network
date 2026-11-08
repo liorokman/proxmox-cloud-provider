@@ -65,4 +65,8 @@ ip netns exec LB sysctl -q net.ipv4.vs.conntrack=1
 # source rewritten, otherwise the target answers the client directly.
 ETH1_NET=$(ip netns exec LB ip -j route show dev eth1 scope link | jq -r '.[0].dst')
 ip netns exec LB iptables -t nat -A POSTROUTING -s "$ETH1_NET" -d "$ETH1_NET" -m ipvs --ipvs -j MASQUERADE
+# Replies of load balanced connections are rewritten by IPVS and must keep the virtual IP as their
+# source. Without this exemption the SNAT below catches them whenever conntrack has no entry for the
+# flow (a standby that took over with synchronized IPVS connections), and every such flow resets.
+ip netns exec LB iptables -t nat -A POSTROUTING -o eth2 -m ipvs --ipvs -j ACCEPT
 ip netns exec LB iptables -t nat -A POSTROUTING -o eth2 -j SNAT --to-source "$EXT_IP"
