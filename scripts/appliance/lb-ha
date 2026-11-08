@@ -1,0 +1,68 @@
+#!/bin/bash
+
+# Copyright 2026 Lior Okman
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Write the keepalived configuration of one container of a highly available
+# pair. Settings from /etc/lbmanager/appliance.env (HA=yes):
+#   HA_PEER        the other container's address on the cluster network (eth1)
+#   HA_PRIORITY    higher wins the first election (150 for the first, 100 for the second)
+#   HA_GATEWAY     the cluster network's gateway address with its prefix, e.g. 192.168.40.1/24;
+#                  moves with the active container
+#   HA_VRID        VRRP id and IPVS sync id (default 51); one pair per cluster network
+#   EXT_IP, EXT_MASK, EXT_GW  the shared egress address and the LAN's gateway
+# Virtual IPs of the load balancers are added by lbmanager in /etc/keepalived/vips.conf.
+set -euo pipefail
+. /etc/lbmanager/appliance.env
+
+: "${HA_PEER:?}" "${HA_PRIORITY:?}" "${HA_GATEWAY:?}" "${EXT_IP:?}" "${EXT_MASK:?}" "${EXT_GW:?}"
+HA_VRID=${HA_VRID:-51}
+
+# Own address on the cluster network, from inside the namespace
+SELF=$(ip netns exec LB ip -j addr show dev eth1 | jq -r --arg gw "${HA_GATEWAY%/*}" '[.[0].addr_info[] | select(.family == "inet" and .local != $gw)][0].local')
+[ -n "$SELF" ] && [ "$SELF" != null ] || { echo "eth1 has no address of its own" >&2; exit 1; }
+
+mkdir -p /etc/keepalived
+[ -f /etc/keepalived/vips.conf ] || : > /etc/keepalived/vips.conf
+
+# maxlen: the cluster network is a VXLAN with a 1450 byte MTU, the interface says 1500. Longer
+# synchronization messages are lost.
+cat > /etc/keepalived/keepalived.conf << END
+global_defs {
+  router_id LB_$SELF
+  vrrp_garp_master_repeat 3
+  vrrp_garp_master_refresh 0
+  lvs_sync_daemon eth1 VI_1 id $HA_VRID maxlen 1300
+}
+vrrp_instance VI_1 {
+  state BACKUP
+  interface eth1
+  virtual_router_id $HA_VRID
+  priority $HA_PRIORITY
+  advert_int 1
+  nopreempt
+  unicast_src_ip $SELF
+  unicast_peer { $HA_PEER }
+  virtual_ipaddress {
+    $HA_GATEWAY dev eth1
+    $EXT_IP/$EXT_MASK dev eth2
+    include /etc/keepalived/vips.conf
+  }
+  virtual_routes {
+    0.0.0.0/0 via $EXT_GW dev eth2
+  }
+}
+END

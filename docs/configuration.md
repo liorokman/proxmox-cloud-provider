@@ -112,6 +112,7 @@ shows the common ones. Settings that are not obvious:
 | `EXTRA_CP_VMID_START`, `EXTRA_CP_IP_START` | `CONTROL_PLANE_VMID + 50`, `NODE_IP_START + 50` | VM ID and last address octet of the second control plane, the others follow. Apart from the workers' numbers, so that adding workers doesn't renumber them |
 | `HA` | `no` | `yes`: HA resources; needs 2 or more Proxmox nodes. With 3 or more there are anti-affinity rules too (load balancer away from the control plane, workers from each other), as far as the guests still fit on the nodes left after one node fails. With 3 or more control planes, one per Proxmox node, which keeps etcd's majority through a node failure |
 | `LB_MODE` | `appliance` | Or `hookscript` |
+| `LB_REPLICAS` | `1` | `2`: a second load balancer container (active/passive pair, **experimental**: `lbmanager` does not yet keep the virtual IPs of Services on the active container, and the cloud provider only talks to the first one). Needs `LB_MODE=appliance`, and `LB_OWN_EXT_IP`, `LB2_OWN_EXT_IP` (each container's own LAN address; `LB_EXT_IP` becomes the shared egress address) and `LB2_MGMT_IP`. `LB2_VMID` defaults to `LB_VMID + 1`. The node network gets the gateway address on whichever container is active, and the containers take the last two addresses (`.253`, `.254`) |
 | `IMAGE_TAG`, `IMAGE_ARCHIVE` | | A cloud provider image other than the chart's, or one loaded from a local archive |
 
 ## Appliance (`/etc/lbmanager/appliance.env`)
@@ -120,6 +121,10 @@ shows the common ones. Settings that are not obvious:
 |---|---|
 | `EXT_IP`, `EXT_MASK` | The container's own address on the LAN |
 | `RANGE_START`, `RANGE_END` | The dynamic range of virtual IPs |
+| `EXT_GW` | The LAN's gateway (default: the management interface's) |
+| `HA` | `yes`: one container of a pair. `lb-keepalived.service` then runs keepalived in the `LB` namespace (VRRP over unicast on `eth1`, and the IPVS connection synchronization daemon, so established connections survive a switch). Without it, the unit is skipped |
+| `HA_EXT_IP` | This container's own LAN address; `EXT_IP` is shared and moves with the active container |
+| `HA_PEER`, `HA_PRIORITY`, `HA_GATEWAY`, `HA_VRID` | The other container's address on `eth1`; 150 for the first and 100 for the second; the node network's gateway with its prefix (moves with the active container); VRRP and sync id (`51`) |
 
 ## Hookscript container (`scripts/installLB.sh`)
 

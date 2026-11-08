@@ -70,7 +70,7 @@ pct exec "$ID" -- getent hosts deb.debian.org > /dev/null || die "the build cont
 echo "==> Packages"
 pct exec "$ID" -- bash -c 'export DEBIAN_FRONTEND=noninteractive LC_ALL=C
 	apt-get -y update > /dev/null
-	apt-get -y install --no-install-recommends ipvsadm iptables jq golang-cfssl ca-certificates > /dev/null
+	apt-get -y install --no-install-recommends ipvsadm iptables keepalived jq golang-cfssl ca-certificates > /dev/null
 	apt-get -y purge openssh-server > /dev/null 2>&1 || true
 	apt-get -y autoremove --purge > /dev/null; apt-get clean; rm -rf /var/lib/apt/lists/*'
 
@@ -87,10 +87,12 @@ else
 fi
 for b in lbmanager lbctl; do pct push "$ID" "$WORK/$b" "/usr/local/bin/$b" --perms 0755; done
 rm -rf "$WORK"
-for f in lb-network lb-prepare; do pct push "$ID" "$APPLIANCE_DIR/$f" "/usr/local/sbin/$f" --perms 0755; done
-for f in lb-network.service lbmanager.service; do pct push "$ID" "$APPLIANCE_DIR/$f" "/etc/systemd/system/$f" --perms 0644; done
+for f in lb-network lb-prepare lb-ha; do pct push "$ID" "$APPLIANCE_DIR/$f" "/usr/local/sbin/$f" --perms 0755; done
+for f in lb-network.service lbmanager.service lb-keepalived.service; do pct push "$ID" "$APPLIANCE_DIR/$f" "/etc/systemd/system/$f" --perms 0644; done
 pct exec "$ID" -- bash -c 'mkdir -p /etc/lbmanager /var/lib/lbstate
-	systemctl enable lb-network.service lbmanager.service > /dev/null 2>&1
+	systemctl enable lb-network.service lbmanager.service lb-keepalived.service > /dev/null 2>&1
+	# keepalived runs inside the LB namespace (lb-keepalived.service); the packaged unit would start it outside
+	systemctl mask keepalived.service > /dev/null 2>&1 || true
 	# a version marker, for `pct exec <id> cat /etc/lbmanager-version`
 	echo "'"$NAME"'" > /etc/lbmanager-version
 	: > /etc/machine-id; rm -f /etc/hostname.bak; rm -rf /tmp/* /var/log/*.log /var/log/apt/*'

@@ -22,6 +22,8 @@
 # Settings come from /etc/lbmanager/appliance.env:
 #   EXT_IP, EXT_MASK   the load balancer's own address on the LAN
 #   EXT_GW             the LAN's gateway (default: eth0's default gateway)
+#   HA=yes             one of a pair (see lb-ha). EXT_IP is then the shared egress address,
+#                      which keepalived moves; HA_EXT_IP is this container's own address on the LAN
 set -euo pipefail
 . /etc/lbmanager/appliance.env
 
@@ -54,8 +56,14 @@ ip link set eth2 netns LB
 ip netns exec LB sysctl -q net.ipv6.conf.eth2.disable_ipv6=1
 ip netns exec LB sysctl -q net.ipv4.conf.eth2.arp_notify=1
 ip netns exec LB ip link set eth2 up
-ip netns exec LB ip addr add "$EXT_IP/$EXT_MASK" dev eth2
-ip netns exec LB ip route add default via "$EXT_GW"
+if [ "${HA:-no}" = yes ]; then
+	# keepalived owns EXT_IP and the default route on whichever container is active
+	[ -n "${HA_EXT_IP:-}" ] || { echo "HA=yes needs HA_EXT_IP (this container's own LAN address)" >&2; exit 1; }
+	ip netns exec LB ip addr add "$HA_EXT_IP/$EXT_MASK" dev eth2
+else
+	ip netns exec LB ip addr add "$EXT_IP/$EXT_MASK" dev eth2
+	ip netns exec LB ip route add default via "$EXT_GW"
+fi
 
 ip netns exec LB sysctl -q net.ipv4.ip_forward=1
 ip netns exec LB sysctl -q net.ipv4.vs.conntrack=1

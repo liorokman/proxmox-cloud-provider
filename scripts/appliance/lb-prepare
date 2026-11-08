@@ -27,15 +27,22 @@ MGMT_IP=$(ip -j addr show dev eth0 | jq -r '.[0].addr_info[] | select(.family ==
 [ -n "$MGMT_IP" ] || { echo "eth0 has no address" >&2; exit 1; }
 
 mkdir -p $STATE/ca $STATE/db /etc/lbmanager
-if [ ! -f $STATE/ca/ca.pem ]; then
-	cd $STATE/ca
+# Each file is made when missing: the second container of a pair is given the CA and the client
+# certificate of the first, and only needs its own server certificate.
+mkdir -p $STATE/ca
+cd $STATE/ca
+if [ ! -f ca.pem ]; then
 	echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"HomeLab","CN":"Root LB CA"}]}' | cfssl genkey -initca - | cfssljson -bare ca
+fi
+if [ ! -f lbmanager.pem ]; then
 	echo "{\"hosts\":[\"$MGMT_IP\",\"127.0.0.1\",\"localhost\"],\"key\":{\"algo\":\"rsa\",\"size\":2048},\"names\":[{\"O\":\"Homelab\",\"CN\":\"$MGMT_IP\"}]}" \
 		| cfssl gencert -ca ca.pem -ca-key ca-key.pem - | cfssljson -bare lbmanager
+fi
+if [ ! -f lbctl.pem ]; then
 	echo '{"key":{"algo":"rsa","size":2048},"names":[{"O":"Homelab","CN":"lbctl"}]}' \
 		| cfssl gencert -ca ca.pem -ca-key ca-key.pem - | cfssljson -bare lbctl
-	chmod 600 $STATE/ca/*-key.pem
 fi
+chmod 600 $STATE/ca/*-key.pem
 cp $STATE/ca/lbmanager.pem /etc/lbmanager/cert.pem
 cp $STATE/ca/lbmanager-key.pem /etc/lbmanager/key.pem
 cp $STATE/ca/lbctl.pem /etc/lbmanager/lbctl.pem

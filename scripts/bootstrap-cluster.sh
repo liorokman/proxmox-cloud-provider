@@ -101,6 +101,14 @@ fi
 # Load balancer container
 : "${LB_VMID:=1100}"
 : "${LB_MODE:=appliance}"                  # appliance (a prebuilt template, built when missing) or hookscript (stock Debian + installLB.sh)
+# A second load balancer container (active/passive pair, experimental: the cloud provider does
+# not use the second one yet). LB_EXT_IP is then the shared egress address, and the gateway of
+# the node network moves with the active container. Needs LB_MODE=appliance.
+: "${LB_REPLICAS:=1}"                     # 1 or 2
+: "${LB2_VMID:=$((LB_VMID + 1))}"
+: "${LB_OWN_EXT_IP:=}"                    # LB_REPLICAS=2: each container's own LAN address (egress/VIPs are shared),
+: "${LB2_OWN_EXT_IP:=}"                   #   and management address of the second one
+: "${LB2_MGMT_IP:=}"
 : "${LB_STATE_GB:=1}"                     # appliance: size of the volume that keeps the CA and the database
 : "${LB_TEMPLATE:=debian-13-standard_13.6-1_amd64.tar.zst}"   # hookscript mode only
 : "${LB_TEMPLATE_STORAGE:=local}"
@@ -261,7 +269,10 @@ wait_for() { # description, tries, command...
 # kubectl on the control plane (the Proxmox node doesn't need it)
 kc() { vm_exec "$(node_vmid 0)" "kubectl --kubeconfig /etc/kubernetes/admin.conf $*"; }
 
+# On every container of the pair
+lb_ids() { echo "$LB_VMID"; [ "$LB_REPLICAS" -lt 2 ] || echo "$LB2_VMID"; }
 lbctl() { pct exec "$LB_VMID" -- /usr/local/bin/lbctl "$@" 2>&1; }
+lbctl_all() { local id; for id in $(lb_ids); do pct exec "$id" -- /usr/local/bin/lbctl "$@" 2>&1; done; }
 
 # ----------------------------------------------------------------------------
 # Steps
@@ -270,6 +281,12 @@ preflight() {
 	log "Checking the environment"
 	require LAN_GW LB_MGMT_IP LB_EXT_IP LB_EXT_START LB_EXT_END K8S_TEMPLATE_ID SSH_PUBLIC_KEY_FILE
 	derive_network
+	case "$LB_REPLICAS" in
+		1) ;;
+		2) require LB_OWN_EXT_IP LB2_OWN_EXT_IP LB2_MGMT_IP
+		   [ "$LB_MODE" = appliance ] || die "LB_REPLICAS=2 needs LB_MODE=appliance" ;;
+		*) die "LB_REPLICAS must be 1 or 2" ;;
+	esac
 	[ -r "$SSH_PUBLIC_KEY_FILE" ] || die "cannot read SSH_PUBLIC_KEY_FILE=$SSH_PUBLIC_KEY_FILE"
 	qm config "$K8S_TEMPLATE_ID" 2> /dev/null | grep -q '^template: 1' \
 		|| die "VM $K8S_TEMPLATE_ID is not a template. Build one first, see the README"
@@ -350,9 +367,16 @@ lb_desc() {
 		'{ip:$ip, mask:$mask, start:$s, end:$e}'
 }
 
-lb_nics() {
-	echo "-net0 name=eth0,bridge=$LAN_BRIDGE,firewall=1,ip=$LB_MGMT_IP/$LAN_CIDR_BITS,gw=$LAN_GW,type=veth"
-	echo "-net1 name=eth1,bridge=$VNET,firewall=1,ip=$GATEWAY_IP/24,type=veth"
+# The node network address of container 1 and 2 of a pair. The gateway moves between them
+lb_node_ip() { echo "$SUBNET_PREFIX.$((253 + $1))"; }
+
+lb_nics() { # [1|2], default 1
+	local n=${1:-1} mgmt=$LB_MGMT_IP eth1=$GATEWAY_IP
+	[ "$n" = 1 ] || mgmt=$LB2_MGMT_IP
+	[ "$LB_REPLICAS" -lt 2 ] || eth1=$(lb_node_ip "$n")
+	echo "-net0 name=eth0,bridge=$LAN_BRIDGE,firewall=1,ip=$mgmt/$LAN_CIDR_BITS,gw=$LAN_GW,type=veth"
+	# mtu: the VNet is a VXLAN with a 1450 byte path
+	echo "-net1 name=eth1,bridge=$VNET,firewall=1,ip=$eth1/24,type=veth"
 	echo "-net2 name=eth2,bridge=$LAN_BRIDGE,firewall=1,type=veth"
 }
 
@@ -380,8 +404,8 @@ create_lb_hookscript() {
 	pct set "$LB_VMID" -hookscript "$SNIPPET_STORAGE:snippets/installLB.sh"
 }
 
-create_lb_appliance() {
-	local name
+create_lb_appliance() { # [vmid] [n]
+	local id=${1:-$LB_VMID} n=${2:-1} name
 	if [ -n "$LBMANAGER_BIN_DIR" ]; then name=lbmanager-dev
 	else name=lbmanager-${LBMANAGER_VERSION:-$(sed -n 's/^LBMANAGER_VERSION=\${LBMANAGER_VERSION:-\(.*\)}/\1/p' "$SCRIPT_DIR/installLB.sh")}; fi
 	local tmpl=${name}_amd64.tar.zst
@@ -390,42 +414,78 @@ create_lb_appliance() {
 		STORAGE=$STORAGE TEMPLATE_STORAGE=$LB_TEMPLATE_STORAGE BUILD_BRIDGE=$LAN_BRIDGE \
 			LBMANAGER_VERSION=$LBMANAGER_VERSION LBMANAGER_BIN_DIR=$LBMANAGER_BIN_DIR "$SCRIPT_DIR/build-appliance.sh" > /dev/null
 	fi
+	local host=$CLUSTER_NAME-lb
+	[ "$LB_REPLICAS" -lt 2 ] || host=$CLUSTER_NAME-lb$n
 	# shellcheck disable=SC2046
-	pct create "$LB_VMID" "$LB_TEMPLATE_STORAGE:vztmpl/$tmpl" \
-		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$CLUSTER_NAME-lb" $(lb_nics) \
+	pct create "$id" "$LB_TEMPLATE_STORAGE:vztmpl/$tmpl" \
+		-unprivileged 0 -cores 2 -swap 0 -memory 512 -hostname "$host" $(lb_nics "$n") \
 		-ostype debian -features nesting=1 -rootfs "$STORAGE:4" -mp0 "$STORAGE:$LB_STATE_GB,mp=/var/lib/lbstate,backup=1" \
 		-description "$(lb_desc)" -onboot 1 -tags "$TAGS;k8s-lb" -pool "$POOL" > /dev/null
 }
 
+# Start one container of the load balancer and give it its settings. n: 1 or 2
+start_lb() { # vmid n
+	local id=$1 n=$2
+	if [ "$(pct status "$id" | awk '{print $2}')" != running ]; then
+		pct start "$id"
+	fi
+	if [ "$LB_MODE" = appliance ] && ! pct exec "$id" -- test -f /etc/lbmanager/appliance.env; then
+		# The units in the image wait for this file
+		local env; env=$(mktemp)
+		printf 'EXT_IP=%s\nEXT_MASK=%s\nRANGE_START=%s\nRANGE_END=%s\n' "$LB_EXT_IP" "$LAN_CIDR_BITS" "$LB_EXT_START" "$LB_EXT_END" > "$env"
+		if [ "$LB_REPLICAS" -ge 2 ]; then
+			local own=$LB_OWN_EXT_IP peer prio=150
+			[ "$n" = 1 ] || { own=$LB2_OWN_EXT_IP; prio=100; }
+			peer=$(lb_node_ip $((3 - n)))
+			printf 'EXT_GW=%s\nHA=yes\nHA_EXT_IP=%s\nHA_PEER=%s\nHA_PRIORITY=%s\nHA_GATEWAY=%s/24\n' \
+				"$LAN_GW" "$own" "$peer" "$prio" "$GATEWAY_IP" >> "$env"
+		fi
+		wait_for "the container to boot" 24 pct exec "$id" -- true
+		pct push "$id" "$env" /etc/lbmanager/appliance.env --perms 0644
+		rm -f "$env"
+		if [ "$n" = 2 ]; then
+			# Same CA as the first container, so one client certificate works for both
+			local f
+			for f in ca.pem ca-key.pem lbctl.pem lbctl-key.pem; do
+				pct exec "$LB_VMID" -- cat "/var/lib/lbstate/ca/$f" > "$STATE_DIR/lb-ca.$f"
+				pct exec "$id" -- mkdir -p /var/lib/lbstate/ca
+				pct push "$id" "$STATE_DIR/lb-ca.$f" "/var/lib/lbstate/ca/$f" --perms 0600
+				rm -f "$STATE_DIR/lb-ca.$f"
+			done
+		fi
+		pct exec "$id" -- systemctl start lb-network lbmanager
+		if [ "$LB_REPLICAS" -ge 2 ]; then pct exec "$id" -- systemctl start lb-keepalived; fi
+	fi
+	wait_for "lbmanager on $id to start" 60 pct exec "$id" -- systemctl is-active --quiet lbmanager
+	# The first start of lbmanager can be before its certificates are readable
+	wait_for "lbctl on $id to connect" 24 pct exec "$id" -- /usr/local/bin/lbctl -op list
+}
+
 step_loadbalancer() {
-	log "Load balancer container $LB_VMID ($LB_MODE)"
+	log "Load balancer container $LB_VMID ($LB_MODE, $LB_REPLICAS container(s))"
 	if ! ct_exists "$LB_VMID"; then
 		case "$LB_MODE" in
-			appliance) create_lb_appliance ;;
+			appliance) create_lb_appliance "$LB_VMID" 1 ;;
 			hookscript) create_lb_hookscript ;;
 			*) die "LB_MODE must be appliance or hookscript" ;;
 		esac
 		info "created container $LB_VMID"
 	fi
-	if [ "$(pct status "$LB_VMID" | awk '{print $2}')" != running ]; then
-		pct start "$LB_VMID"
+	start_lb "$LB_VMID" 1
+	if [ "$LB_REPLICAS" -ge 2 ]; then
+		if ! ct_exists "$LB2_VMID"; then
+			create_lb_appliance "$LB2_VMID" 2
+			info "created container $LB2_VMID"
+		fi
+		start_lb "$LB2_VMID" 2
 	fi
-	if [ "$LB_MODE" = appliance ] && ! pct exec "$LB_VMID" -- test -f /etc/lbmanager/appliance.env; then
-		# The units in the image wait for this file
-		local env; env=$(mktemp)
-		printf 'EXT_IP=%s\nEXT_MASK=%s\nRANGE_START=%s\nRANGE_END=%s\n' "$LB_EXT_IP" "$LAN_CIDR_BITS" "$LB_EXT_START" "$LB_EXT_END" > "$env"
-		wait_for "the container to boot" 24 pct exec "$LB_VMID" -- true
-		pct push "$LB_VMID" "$env" /etc/lbmanager/appliance.env --perms 0644
-		rm -f "$env"
-		pct exec "$LB_VMID" -- systemctl start lb-network lbmanager
-	fi
-	wait_for "lbmanager to start" 60 pct exec "$LB_VMID" -- systemctl is-active --quiet lbmanager
-	# The first start of lbmanager can be before its certificates are readable
-	wait_for "lbctl to connect" 24 pct exec "$LB_VMID" -- /usr/local/bin/lbctl -op list
-	if ! lbctl -op list | grep -q 'name:"apiserver"'; then
-		lbctl -op addSrv -name apiserver -srv "$API_VIP" > /dev/null
-		info "load balancer entry for the API server at $API_VIP"
-	fi
+	local id
+	for id in $(lb_ids); do
+		if ! pct exec "$id" -- /usr/local/bin/lbctl -op list 2>&1 | grep -q 'name:"apiserver"'; then
+			pct exec "$id" -- /usr/local/bin/lbctl -op addSrv -name apiserver -srv "$API_VIP" > /dev/null
+			info "load balancer entry for the API server at $API_VIP ($id)"
+		fi
+	done
 }
 
 # The pool exists before the first guest, which is created in it
@@ -501,7 +561,7 @@ step_vms() {
 step_pool() {
 	local members id i
 	members=$(pve get "/pools/$POOL" | jq -r '.members[]?.vmid' 2> /dev/null || true)
-	for id in "$LB_VMID" $(for i in $(node_slots); do node_vmid "$i"; done); do
+	for id in $(lb_ids) $(for i in $(node_slots); do node_vmid "$i"; done); do
 		grep -qx "$id" <<< "$members" && continue
 		pvesh set "/pools/$POOL" --vms "$id" > /dev/null
 		info "added $id to the pool"
@@ -524,7 +584,7 @@ step_ha() {
 	nodes=$(pve get /nodes | jq 'length')
 	[ "$nodes" -ge 2 ] || { info "HA=yes needs a Proxmox cluster of 2 nodes or more, skipping"; return 0; }
 	pve get /cluster/ha/resources > /dev/null || die "cannot read the HA resources (is this node in a cluster?)"
-	for id in $(for i in $(if cp_local; then worker_slots; else node_slots; fi); do echo "vm:$(node_vmid "$i")"; done) "ct:$LB_VMID"; do
+	for id in $(for i in $(if cp_local; then worker_slots; else node_slots; fi); do echo "vm:$(node_vmid "$i")"; done) $(for i in $(lb_ids); do echo "ct:$i"; done); do
 		pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null \
 			|| { pvesh create /cluster/ha/resources --sid "$id" --state started > /dev/null; info "HA resource $id"; }
 	done
@@ -537,6 +597,13 @@ step_ha() {
 		ha_rule "ha-$CLUSTER_NAME-lb" "ct:$LB_VMID,vm:$(node_vmid 0)"
 	else
 		info "no anti-affinity rule for the load balancer: after a node failure it would have no node left (needs 3 nodes)"
+	fi
+	if [ "$LB_REPLICAS" -ge 2 ]; then
+		if [ "$nodes" -ge 3 ]; then
+			ha_rule "ha-$CLUSTER_NAME-lbpair" "ct:$LB_VMID,ct:$LB2_VMID"
+		else
+			info "no anti-affinity rule for the load balancer pair: needs 3 Proxmox nodes (the containers may share a node)"
+		fi
 	fi
 	if [ "$WORKERS" -ge 2 ]; then
 		if [ "$WORKERS" -le $((nodes - 1)) ]; then
@@ -583,7 +650,7 @@ step_control_plane() {
 	id=$(node_vmid 0); ip=$(node_ip 0)
 	# kubeadm checks the API server through the load balancer, so the target must exist before it runs
 	if ! lbctl -op list | grep 'name:"apiserver"' | grep -q "dstIP:\"$ip\""; then
-		lbctl -op addTgt -name apiserver -srv "$ip" -sport 6443 -dport 6443 > /dev/null
+		lbctl_all -op addTgt -name apiserver -srv "$ip" -sport 6443 -dport 6443 > /dev/null
 		info "API server target $ip:6443"
 	fi
 	prepare_kubelet "$id"
@@ -601,7 +668,7 @@ step_control_plane() {
 	for i in $(extra_cp_slots); do
 		id2=$(node_vmid "$i"); name=$(node_name "$i"); ip2=$(node_ip "$i")
 		if ! lbctl -op list | grep 'name:"apiserver"' | grep -q "dstIP:\"$ip2\""; then
-			lbctl -op addTgt -name apiserver -srv "$ip2" -sport 6443 -dport 6443 > /dev/null
+			lbctl_all -op addTgt -name apiserver -srv "$ip2" -sport 6443 -dport 6443 > /dev/null
 			info "API server target $ip2:6443"
 		fi
 		if vm_exec "$id2" 'test -f /etc/kubernetes/kubelet.conf' > /dev/null 2>&1; then
@@ -678,6 +745,7 @@ ensure_helm() {
 
 step_cloud_provider() {
 	log "Cloud provider"
+	[ "$LB_REPLICAS" -lt 2 ] || info "WARNING: the cloud provider only talks to $LB_MGMT_IP: Services are not applied to the second container yet"
 	ensure_helm
 	local work; work=$(mktemp -d)
 	local f
@@ -754,9 +822,11 @@ EOF
 cmd_status() {
 	require K8S_TEMPLATE_ID
 	derive_network
-	local i
+	local i id
 	printf '%-20s %s\n' "SDN VNet $VNET" "$(ip link show "$VNET" > /dev/null 2>&1 && echo present || echo missing)"
-	printf '%-20s %s\n' "container $LB_VMID" "$(pct status "$LB_VMID" 2> /dev/null || echo missing)"
+	for id in $(lb_ids); do
+		printf '%-20s %s\n' "container $id" "$(pct status "$id" 2> /dev/null || echo missing)"
+	done
 	for i in $(node_slots); do
 		printf '%-20s %s\n' "$(node_name "$i") ($(node_vmid "$i"))" "$(qm status "$(node_vmid "$i")" 2> /dev/null || echo missing)"
 	done
@@ -770,10 +840,10 @@ cmd_destroy() {
 	local i id
 	# HA resources first: the HA manager would start the guests again
 	if pve get /cluster/ha/rules 2> /dev/null | jq -e '.' > /dev/null 2>&1; then
-		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-workers" "ha-$CLUSTER_NAME-cp"; do
+		for r in "ha-$CLUSTER_NAME-lb" "ha-$CLUSTER_NAME-lbpair" "ha-$CLUSTER_NAME-workers" "ha-$CLUSTER_NAME-cp"; do
 			pve get /cluster/ha/rules | jq -e --arg r "$r" '.[] | select(.rule == $r)' > /dev/null && pvesh delete "/cluster/ha/rules/$r" > /dev/null
 		done
-		for id in "ct:$LB_VMID" $(for i in $(node_slots); do echo "vm:$(node_vmid "$i")"; done); do
+		for id in "ct:$LB_VMID" "ct:$LB2_VMID" $(for i in $(node_slots); do echo "vm:$(node_vmid "$i")"; done); do
 			pve get /cluster/ha/resources | jq -e --arg s "$id" '.[] | select(.sid == $s)' > /dev/null && pvesh delete "/cluster/ha/resources/$id" > /dev/null
 		done
 	fi
@@ -785,11 +855,13 @@ cmd_destroy() {
 			info "deleted VM $id"
 		fi
 	done
-	if ct_exists "$LB_VMID"; then
-		pct stop "$LB_VMID" > /dev/null 2>&1 || true
-		pct destroy "$LB_VMID" --purge 1 > /dev/null
-		info "deleted container $LB_VMID"
-	fi
+	for id in "$LB_VMID" "$LB2_VMID"; do
+		if ct_exists "$id"; then
+			pct stop "$id" > /dev/null 2>&1 || true
+			pct destroy "$id" --purge 1 > /dev/null
+			info "deleted container $id"
+		fi
+	done
 	if pve get /cluster/sdn/vnets | jq -e --arg v "$VNET" '.[] | select(.vnet == $v)' > /dev/null; then
 		pve get "/cluster/sdn/vnets/$VNET/subnets" | jq -r '.[].subnet' | while read -r s; do
 			pvesh delete "/cluster/sdn/vnets/$VNET/subnets/$s" > /dev/null
