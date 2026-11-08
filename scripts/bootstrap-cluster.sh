@@ -32,6 +32,9 @@
 # repeated. See scripts/cluster.env.example for the settings.
 
 set -euo pipefail
+# Proxmox's perl tools print warnings on stderr when the locale (inherited over ssh) is not
+# installed; vm_exec merges stderr into the JSON it parses
+export LC_ALL=C
 
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 REPO_DIR=$(dirname "$SCRIPT_DIR")
