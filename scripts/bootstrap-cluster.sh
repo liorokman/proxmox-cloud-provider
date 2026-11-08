@@ -230,8 +230,11 @@ on_owner() { # tool args...
 		if [[ $a =~ ^[0-9]+$ ]]; then id=$a; break; fi
 	done
 	[ -z "$id" ] || node=$(guest_node "$id")
+	run_on "$node" "$tool" "$@"
+}
+run_on() { # node tool args...: run on that node, by address (the node names don't have to resolve)
+	local node=$1 tool=$2; shift 2
 	if [ -z "$node" ] || [ "$node" = "$NODE" ]; then command "$tool" "$@"; return; fi
-	# By address: the node names don't have to resolve
 	local addr
 	addr=$(pvesh get /cluster/status --output-format json 2> /dev/null | jq -r --arg n "$node" '.[] | select(.type == "node" and .name == $n) | .ip')
 	ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o LogLevel=ERROR "root@${addr:-$node}" "LC_ALL=C $(printf '%q ' "$tool" "$@")"
@@ -529,8 +532,9 @@ step_vms() {
 		id=$(node_vmid "$i"); name=$(node_name "$i"); ip=$(node_ip "$i")
 		if ! vm_exists "$id"; then
 			if is_cp "$i" && cp_local; then
-				# The template is on shared storage, so the clone can be made on another node
-				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --target "$(cp_node "$i")" --pool "$POOL" > /dev/null
+				# The template is on shared storage, so any node can clone it; the clone is made on
+				# the node that is to keep it (--target doesn't allow node local storage)
+				run_on "$(cp_node "$i")" qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$CP_STORAGE" --pool "$POOL" > /dev/null
 			else
 				qm clone "$K8S_TEMPLATE_ID" "$id" --full --name "$name" --storage "$STORAGE" --pool "$POOL" > /dev/null
 			fi
