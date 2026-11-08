@@ -122,6 +122,16 @@ only set when a node registers, so existing nodes keep their old ones.
 15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, with several
     control planes and Proxmox nodes since v0.3.1). Cluster API integration is still open. **L**
 
+### Done in v0.4.0
+
+* An optional active/passive pair of load balancer containers (`LB_REPLICAS=2`, see "Implementation
+  notes for the load balancer pair"). Tested on a three node Proxmox cluster: the pair on different
+  nodes, ten long downloads survived a graceful stop and a hard stop of the active container in
+  both directions, and a restarted container rejoined as standby with the connection table.
+* The cloud provider can apply Services to several `lbmanager`s (`managerHosts`).
+* Bootstrap script fixes found by building the pair: node local control plane clones, the
+  second container's address, a wait for `eth1`, `pipefail` with `grep -q`, and locale warnings.
+
 ### Done in v0.3.1
 
 * Resource pool per cluster, a token that only sees its pool, and a user per cluster (bootstrap script).
