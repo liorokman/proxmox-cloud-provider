@@ -29,6 +29,12 @@ data:
            key: /var/run/secrets/ccm/tls.key
            ca: /var/run/secrets/ccm/ca.crt
        managerHost: {{ .Values.lbmanager.hostname }}
+       {{- with .Values.lbmanager.additionalHostnames }}
+       managerHosts:
+         {{- range . }}
+         - {{ . | quote }}
+         {{- end }}
+       {{- end }}
        managerPort: {{ default "9999" .Values.lbmanager.port }}
        proxmoxConfig:
          url:  {{ .Values.proxmox.apiURL }}

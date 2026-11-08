@@ -30,6 +30,9 @@ image:
 # The mTLS configuration for lbManager
 lbmanager:
   hostname: 
+  # The other load balancer containers of an active/passive pair (they share the
+  # CA and the client certificate). Every Service is applied to all of them.
+  additionalHostnames: []
   port: "9999"
   tls:
     key:

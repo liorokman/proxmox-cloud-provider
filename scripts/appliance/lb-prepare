@@ -72,6 +72,12 @@ metrics:
   listen: $MGMT_IP:9100
 END
 
+if [ "${HA:-no}" = yes ]; then
+	# keepalived owns the virtual IPs: lbmanager lists them in a file that
+	# keepalived includes, and the container's own addresses are not for Services
+	sed -i "/^  ipam:/i\\  keepalived:\\n    vipsFile: /etc/keepalived/vips.conf\\n    reserved: [$EXT_IP, ${HA_EXT_IP:-$EXT_IP}]" /etc/lbmanager/lbmanager.yaml
+fi
+
 cat > /etc/lbmanager/lbctl.yaml << END
 ---
 addr: $MGMT_IP:9999

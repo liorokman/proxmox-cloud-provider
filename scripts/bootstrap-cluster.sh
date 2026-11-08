@@ -745,7 +745,6 @@ ensure_helm() {
 
 step_cloud_provider() {
 	log "Cloud provider"
-	[ "$LB_REPLICAS" -lt 2 ] || info "WARNING: the cloud provider only talks to $LB_MGMT_IP: Services are not applied to the second container yet"
 	ensure_helm
 	local work; work=$(mktemp -d)
 	local f
@@ -756,6 +755,7 @@ step_cloud_provider() {
 	local token; token=$(cat "$STATE_DIR/$PVE_USER.$PVE_TOKEN_NAME.token")
 	local args=()
 	[ -z "$IMAGE_TAG" ] || args+=(--set "image.tag=$IMAGE_TAG")
+	[ "$LB_REPLICAS" -lt 2 ] || args+=(--set "lbmanager.additionalHostnames={$LB2_MGMT_IP}")
 	helm upgrade --install proxmox-ccm "$CHART_DIR" --namespace kube-system \
 		--set "lbmanager.hostname=$LB_MGMT_IP" \
 		--set-file "lbmanager.tls.key=$work/lbctl-key.pem" \

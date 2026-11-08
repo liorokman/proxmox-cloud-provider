@@ -243,3 +243,46 @@ func TestEnsureLoadBalancerDeleted(t *testing.T) {
 		t.Error("an rpc error must be reported")
 	}
 }
+
+func TestPairGetsTheSameAddress(t *testing.T) {
+	a, b := &fakeLBClient{}, &fakeLBClient{}
+	lb := &LoadBalancer{client: a, others: []loadbalancer.LoadBalancerClient{b}}
+	st, err := lb.EnsureLoadBalancer(context.Background(), "c", testService(), []*v1.Node{testNode("192.168.100.5")})
+	if err != nil || st.Ingress[0].IP != "192.168.87.210" {
+		t.Fatalf("%v %+v", err, st)
+	}
+	if len(a.applied) != 1 || len(b.applied) != 1 {
+		t.Fatalf("applied %d and %d times", len(a.applied), len(b.applied))
+	}
+	if a.applied[0].IpAddr != nil {
+		t.Errorf("the first one chooses the address")
+	}
+	if b.applied[0].GetIpAddr() != "192.168.87.210" {
+		t.Errorf("the second one must use the chosen address, got %v", b.applied[0].IpAddr)
+	}
+}
+
+func TestPairKeepsAnExistingAddress(t *testing.T) {
+	existing := &loadbalancer.LoadBalancerInformation{Name: "c%default%web", IpAddr: "192.168.87.222"}
+	a, b := &fakeLBClient{getErr: errors.New("down"), applyErr: errors.New("down")}, &fakeLBClient{info: existing}
+	lb := &LoadBalancer{client: a, others: []loadbalancer.LoadBalancerClient{b}}
+	svc := testService()
+	svc.Name, svc.Namespace = "web", "default"
+	if _, err := lb.EnsureLoadBalancer(context.Background(), "c", svc, nil); err == nil {
+		t.Error("an unreachable member must be reported so that the call is retried")
+	}
+	if len(b.applied) != 1 || b.applied[0].GetIpAddr() != "192.168.87.222" {
+		t.Errorf("the reachable one must still be updated with the existing address: %+v", b.applied)
+	}
+}
+
+func TestPairDeleteReachesBoth(t *testing.T) {
+	a, b := &fakeLBClient{}, &fakeLBClient{deleteErr: errors.New("down")}
+	lb := &LoadBalancer{client: a, others: []loadbalancer.LoadBalancerClient{b}}
+	if err := lb.EnsureLoadBalancerDeleted(context.Background(), "c", testService()); err == nil {
+		t.Error("expected an error")
+	}
+	if len(a.deleted) != 1 || len(b.deleted) != 1 {
+		t.Errorf("deleted %d and %d times", len(a.deleted), len(b.deleted))
+	}
+}

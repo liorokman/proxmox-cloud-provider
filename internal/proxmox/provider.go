@@ -52,8 +52,10 @@ func init() {
 
 // ProviderConfig contains the configuration values required by the proxmox provider
 type ProviderConfig struct {
-	Security      Security      `yaml:"security"`
-	ManagerHost   string        `yaml:"managerHost"`
+	Security    Security `yaml:"security"`
+	ManagerHost string   `yaml:"managerHost"`
+	// ManagerHosts are the other load balancer containers of an active/passive pair
+	ManagerHosts  []string      `yaml:"managerHosts"`
 	ManagerPort   int           `yaml:"managerPort"`
 	ClusterConfig ClusterConfig `yaml:"proxmoxConfig"`
 }
@@ -129,18 +131,19 @@ func (p *Provider) Initialize(clientBuilder cloudprovider.ControllerClientBuilde
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
 	}
-	serverAddr := fmt.Sprintf("%s:%d", p.config.ManagerHost, p.config.ManagerPort)
-	conn, err := grpc.NewClient(serverAddr, opts...)
-	if err != nil {
-		log.Fatalf("failed to connect to the lbmanager: %s", err.Error())
+	var clients []loadbalancer.LoadBalancerClient
+	for _, host := range append([]string{p.config.ManagerHost}, p.config.ManagerHosts...) {
+		conn, err := grpc.NewClient(fmt.Sprintf("%s:%d", host, p.config.ManagerPort), opts...)
+		if err != nil {
+			log.Fatalf("failed to connect to the lbmanager %s: %s", host, err.Error())
+		}
+		clients = append(clients, loadbalancer.NewLoadBalancerClient(conn))
+		go func() {
+			<-stop
+			_ = conn.Close()
+		}()
 	}
-	p.lbManager = &LoadBalancer{
-		client: loadbalancer.NewLoadBalancerClient(conn),
-	}
-	go func() {
-		<-stop
-		_ = conn.Close()
-	}()
+	p.lbManager = &LoadBalancer{client: clients[0], others: clients[1:]}
 }
 
 // LoadBalancer returns a balancer interface. Also returns true if the interface is supported, false otherwise.

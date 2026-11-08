@@ -71,6 +71,10 @@ type loadBalancerServer struct {
 	nlHandle     *netlink.Handle
 	ipvsHandle   ipvsns.Client
 	ipam         ipam.IPAM
+	// vips is set in an HA pair: keepalived owns the virtual IPs
+	vips *vipFile
+	// batching postpones writing the virtual IPs to the end of Restore
+	batching bool
 
 	// Health checking; the tracker is protected by mu
 	healthCfg healthConfig
@@ -136,6 +140,8 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		_ = ns.Close()
 		return nil, err
 	}
+	prefix, _ := cidr.Mask.Size()
+	vips := newVIPFile(config, config.MustString("loadbalancer.externalInterface"), prefix)
 	// Addresses that are configured on the interface, but not held by a load
 	// balancer, belong to somebody else (the container itself, for example)
 	isBusy := func(ip net.IP) bool {
@@ -148,7 +154,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 				return true
 			}
 		}
-		return false
+		return vips != nil && vips.isReserved(ip)
 	}
 	ipManagement, err := ipam.New(config, isBusy)
 	if err != nil {
@@ -166,6 +172,7 @@ func NewServer(config *koanf.Koanf) (Intf, error) {
 		nlHandle:     netlinkHandle,
 		ipvsHandle:   ipvsHandle,
 		ipam:         ipManagement,
+		vips:         vips,
 	}
 	lbServer.kick = make(chan struct{}, 1)
 	lbServer.healthCfg = readHealthConfig(config)
@@ -271,6 +278,13 @@ func toIPVSService(l *LoadBalancerInformation, srcPort int32, protocol Protocol)
 func (l *loadBalancerServer) Restore() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.batching = true
+	defer func() {
+		l.batching = false
+		if err := l.flushVIPs(); err != nil {
+			log.Printf("restore: cannot hand the addresses to keepalived: %v", err)
+		}
+	}()
 	return l.forEachLB(func(lb *LoadBalancerInformation) {
 		if err := l.ensureAddrAlias(lb.IpAddr); err != nil {
 			log.Printf("restore: load balancer %s: cannot configure address %s: %v", lb.Name, lb.IpAddr, err)
@@ -387,6 +401,10 @@ func (l *loadBalancerServer) releaseAddr(ip net.IP) error {
 	if l.ipam.Release(ip) > 0 {
 		return nil
 	}
+	if l.vips != nil {
+		delete(l.vips.addrs, ip.String())
+		return l.flushVIPs()
+	}
 	return l.nlHandle.AddrDel(l.externalLink, &netlink.Addr{
 		IPNet: &net.IPNet{IP: ip, Mask: l.cidr.Mask},
 	})
@@ -403,6 +421,10 @@ func (l *loadBalancerServer) ensureAddrAlias(addrString string) error {
 			IP:   externalIP,
 			Mask: l.cidr.Mask,
 		},
+	}
+	if l.vips != nil {
+		l.vips.addrs[externalIP.String()] = true
+		return l.flushVIPs()
 	}
 	addrs, err := l.nlHandle.AddrList(l.externalLink, netlink.FAMILY_ALL)
 	if err != nil {
@@ -686,4 +708,12 @@ func (l *loadBalancerServer) getLB(name string) (*LoadBalancerInformation, error
 
 func asPtr[T any](s T) *T {
 	return &s
+}
+
+// flushVIPs hands the virtual IPs to keepalived (HA pair only).
+func (l *loadBalancerServer) flushVIPs() error {
+	if l.vips == nil || l.batching {
+		return nil
+	}
+	return l.vips.flush()
 }
