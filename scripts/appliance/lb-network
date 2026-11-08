@@ -36,6 +36,12 @@ for i in $(seq 1 30); do
 	[ -n "$EXT_GW" ] && break
 	sleep 1
 done
+# ifupdown can take half a minute to give eth1 its address, and the address is
+# taken over by the namespace
+for i in $(seq 1 90); do
+	ip -j addr show dev eth1 2> /dev/null | jq -e '.[0].addr_info[] | select(.family == "inet")' > /dev/null && break
+	sleep 1
+done
 [ -n "$EXT_GW" ] || { echo "no LAN gateway: set EXT_GW" >&2; exit 1; }
 for i in eth1 eth2; do ip link show dev $i > /dev/null || { echo "$i is missing: the appliance needs three network interfaces" >&2; exit 1; }; done
 

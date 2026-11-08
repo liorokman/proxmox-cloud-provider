@@ -368,7 +368,7 @@ lb_desc() {
 }
 
 # The node network address of container 1 and 2 of a pair. The gateway moves between them
-lb_node_ip() { echo "$SUBNET_PREFIX.$((253 + $1))"; }
+lb_node_ip() { echo "$SUBNET_PREFIX.$((252 + $1))"; }
 
 lb_nics() { # [1|2], default 1
 	local n=${1:-1} mgmt=$LB_MGMT_IP eth1=$GATEWAY_IP
