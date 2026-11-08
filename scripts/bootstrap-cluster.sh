@@ -484,7 +484,7 @@ step_loadbalancer() {
 	fi
 	local id
 	for id in $(lb_ids); do
-		if ! pct exec "$id" -- /usr/local/bin/lbctl -op list 2>&1 | grep -q 'name:"apiserver"'; then
+		if ! grep -q 'name:"apiserver"' <<< "$(pct exec "$id" -- /usr/local/bin/lbctl -op list 2>&1)"; then
 			pct exec "$id" -- /usr/local/bin/lbctl -op addSrv -name apiserver -srv "$API_VIP" > /dev/null
 			info "load balancer entry for the API server at $API_VIP ($id)"
 		fi
@@ -651,12 +651,20 @@ prepare_kubelet() { # vmid
 	vm_exec "$1" 'grep -qs -- "--cloud-provider=external" /etc/default/kubelet || { echo KUBELET_EXTRA_ARGS=--cloud-provider=external > /etc/default/kubelet; }' > /dev/null
 }
 
+# Whether the API server entry of the load balancer has the target (not a pipe into grep -q:
+# with pipefail, lbctl would fail on the closed pipe)
+has_api_target() {
+	local out
+	out=$(lbctl -op list | grep 'name:"apiserver"' || true)
+	grep -q "dstIP:\"$1\"" <<< "$out"
+}
+
 step_control_plane() {
 	log "Control plane"
 	local id ip
 	id=$(node_vmid 0); ip=$(node_ip 0)
 	# kubeadm checks the API server through the load balancer, so the target must exist before it runs
-	if ! lbctl -op list | grep 'name:"apiserver"' | grep -q "dstIP:\"$ip\""; then
+	if ! has_api_target "$ip"; then
 		lbctl_all -op addTgt -name apiserver -srv "$ip" -sport 6443 -dport 6443 > /dev/null
 		info "API server target $ip:6443"
 	fi
@@ -674,7 +682,7 @@ step_control_plane() {
 	local i name ip2 id2 cmd key
 	for i in $(extra_cp_slots); do
 		id2=$(node_vmid "$i"); name=$(node_name "$i"); ip2=$(node_ip "$i")
-		if ! lbctl -op list | grep 'name:"apiserver"' | grep -q "dstIP:\"$ip2\""; then
+		if ! has_api_target "$ip2"; then
 			lbctl_all -op addTgt -name apiserver -srv "$ip2" -sport 6443 -dport 6443 > /dev/null
 			info "API server target $ip2:6443"
 		fi
