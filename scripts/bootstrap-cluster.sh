@@ -412,6 +412,7 @@ create_lb_hookscript() {
 
 create_lb_appliance() { # [vmid] [n]
 	local id=${1:-$LB_VMID} n=${2:-1} name
+	# shellcheck disable=SC2016 # the \$ is a literal in the sed pattern
 	if [ -n "$LBMANAGER_BIN_DIR" ]; then name=lbmanager-dev
 	else name=lbmanager-${LBMANAGER_VERSION:-$(sed -n 's/^LBMANAGER_VERSION=\${LBMANAGER_VERSION:-\(.*\)}/\1/p' "$SCRIPT_DIR/installLB.sh")}; fi
 	local tmpl=${name}_amd64.tar.zst

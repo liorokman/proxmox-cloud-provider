@@ -34,6 +34,7 @@ set -euo pipefail
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 APPLIANCE_DIR=$SCRIPT_DIR/appliance
 
+# shellcheck disable=SC2016 # the \$ is a literal in the sed pattern
 : "${LBMANAGER_VERSION:=$(sed -n 's/^LBMANAGER_VERSION=\${LBMANAGER_VERSION:-\(.*\)}/\1/p' "$SCRIPT_DIR/installLB.sh")}"
 : "${LBMANAGER_BIN_DIR:=}"
 : "${STORAGE:=local-lvm}"
@@ -64,7 +65,7 @@ echo "==> Temporary container $ID"
 pct create "$ID" "$TEMPLATE_STORAGE:vztmpl/$BASE_TEMPLATE" -unprivileged 0 -cores 2 -memory 1024 -swap 0 \
 	-hostname lb-build -net0 "name=eth0,bridge=$BUILD_BRIDGE,ip=dhcp" -storage "$STORAGE" -ostype debian > /dev/null
 pct start "$ID"
-for i in $(seq 1 30); do pct exec "$ID" -- getent hosts deb.debian.org > /dev/null 2>&1 && break; sleep 2; done
+for _ in $(seq 1 30); do pct exec "$ID" -- getent hosts deb.debian.org > /dev/null 2>&1 && break; sleep 2; done
 pct exec "$ID" -- getent hosts deb.debian.org > /dev/null || die "the build container has no network (needs DHCP and internet on $BUILD_BRIDGE)"
 
 echo "==> Packages"
@@ -89,6 +90,7 @@ for b in lbmanager lbctl; do pct push "$ID" "$WORK/$b" "/usr/local/bin/$b" --per
 rm -rf "$WORK"
 for f in lb-network lb-prepare lb-ha; do pct push "$ID" "$APPLIANCE_DIR/$f" "/usr/local/sbin/$f" --perms 0755; done
 for f in lb-network.service lbmanager.service lb-keepalived.service; do pct push "$ID" "$APPLIANCE_DIR/$f" "/etc/systemd/system/$f" --perms 0644; done
+# shellcheck disable=SC2016 # the script runs inside the container; only $NAME is spliced in
 pct exec "$ID" -- bash -c 'mkdir -p /etc/lbmanager /var/lib/lbstate
 	systemctl enable lb-network.service lbmanager.service lb-keepalived.service > /dev/null 2>&1
 	# keepalived runs inside the LB namespace (lb-keepalived.service); the packaged unit would start it outside

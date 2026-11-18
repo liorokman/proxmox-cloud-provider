@@ -28,13 +28,13 @@ writeFile() {
 
 	# The container's description holds the settings as JSON; the API returns it decoded
 	local ct_notes
-	ct_notes=$(pvesh get /nodes/$(hostname)/lxc/$VMID/config --output-format json | jq -r .description)
-	ext_ip=$(echo $ct_notes | jq -r .ip)
-	ext_mask=$(echo $ct_notes | jq -r .mask)
-	ext_end=$(echo $ct_notes | jq -r .end)
-	ext_start=$(echo $ct_notes | jq -r .start)
+	ct_notes=$(pvesh get "/nodes/$(hostname)/lxc/$VMID/config" --output-format json | jq -r .description)
+	ext_ip=$(echo "$ct_notes" | jq -r .ip)
+	ext_mask=$(echo "$ct_notes" | jq -r .mask)
+	ext_end=$(echo "$ct_notes" | jq -r .end)
+	ext_start=$(echo "$ct_notes" | jq -r .start)
 
-	pct exec $VMID tee $filename > /dev/null << EOF
+	pct exec "$VMID" tee "$filename" > /dev/null << EOF
 #!/bin/bash
 
 # Install the necessary tools, unless they are all there already
@@ -197,7 +197,7 @@ systemctl start lbmanager
 
 
 EOF
-	pct exec $VMID chmod +x $filename
+	pct exec "$VMID" chmod +x "$filename"
 }
 
 case "$PHASE"  in
@@ -207,12 +207,12 @@ case "$PHASE"  in
 	   for bin in lbmanager lbctl; do
 		   if [ -f "$SCRIPT_DIR/$bin" ]; then
 			   # pct push can't be used here: the container's config is locked while the hookscript runs
-			   pct exec $VMID -- tee /usr/local/bin/$bin < "$SCRIPT_DIR/$bin" > /dev/null
-			   pct exec $VMID -- chmod 0755 /usr/local/bin/$bin
+			   pct exec "$VMID" -- tee "/usr/local/bin/$bin" < "$SCRIPT_DIR/$bin" > /dev/null
+			   pct exec "$VMID" -- chmod 0755 "/usr/local/bin/$bin"
 		   fi
 	   done
 	   writeFile /install.sh
-	   pct exec $VMID /install.sh
+	   pct exec "$VMID" /install.sh
    ;;
    pre-stop)
    ;;
