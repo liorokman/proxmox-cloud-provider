@@ -122,6 +122,10 @@ only set when a node registers, so existing nodes keep their old ones.
 15. ~~A bootstrap script~~ (done: `scripts/bootstrap-cluster.sh`, with several
     control planes and Proxmox nodes since v0.3.1). Cluster API integration is still open. **L**
 
+### Done in v0.4.1
+
+* Dependency updates and shellcheck fixes in the scripts (quoting in the hookscript).
+
 ### Done in v0.4.0
 
 * An optional active/passive pair of load balancer containers (`LB_REPLICAS=2`, see "Implementation

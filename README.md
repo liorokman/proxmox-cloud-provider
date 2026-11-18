@@ -245,7 +245,7 @@ section, plus a volume for the state (the CA and the database), then give it its
 settings and start the units:
 
 ```bash
-pct create 1100 local:vztmpl/lbmanager-v0.4.0_amd64.tar.zst -unprivileged 0 -pool k8s-red \
+pct create 1100 local:vztmpl/lbmanager-v0.4.1_amd64.tar.zst -unprivileged 0 -pool k8s-red \
     -hostname k8slb1 -memory 512 -features nesting=1 -rootfs $STORAGE:4 \
     -mp0 $STORAGE:1,mp=/var/lib/lbstate,backup=1 \
     -net0 name=eth0,bridge=vmbr0,ip=$LB_MGMT_IP/$EXT_CIDR,gw=$EXT_GW \
@@ -630,7 +630,7 @@ the chart is upgraded. Load balancers and their state are kept in
 `/var/lib/lbmanager` in the container and survive the upgrade.
 
 1. Read the release notes for changes that need manual steps. For the changes
-   since v0.3.1 see "Notes for upgrading from v0.3.1", since v0.3.0 see "Notes for upgrading from v0.3.0", since v0.2.0 see "Notes for upgrading from v0.2.0",
+   since v0.4.0 see "Notes for upgrading from v0.4.0", since v0.3.1 see "Notes for upgrading from v0.3.1", since v0.3.0 see "Notes for upgrading from v0.3.0", since v0.2.0 see "Notes for upgrading from v0.2.0",
    and since v0.1.0 see "Notes for upgrading from v0.1.0", below.
 
 1. Upgrade `lbmanager` and `lbctl`.
@@ -680,6 +680,12 @@ To roll back, put the previous binaries and hookscript back, reboot the
 container, and run `helm rollback proxmox-ccm`. Rolling back has not been
 tested across versions; back up `/var/lib/lbmanager` (or take a container
 snapshot with `pct snapshot`) before upgrading.
+
+## Notes for upgrading from v0.4.0
+
+A maintenance release: dependency updates (OpenTelemetry 1.47.0, `go.yaml.in/yaml/v3` 3.0.5)
+and shellcheck fixes in the scripts. The API between the cloud provider and `lbmanager` is
+unchanged, nothing needs to be done by hand, and the order of the upgrade doesn't matter.
 
 ## Notes for upgrading from v0.3.1
 
